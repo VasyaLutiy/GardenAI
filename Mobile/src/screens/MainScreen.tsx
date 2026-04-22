@@ -137,8 +137,18 @@ export default function MainScreen() {
     pendingCallsRef.current.delete(callId)
   }, [])
 
-  const findPendingAnalyzeCall = useCallback((snapshotId?: string | null, turnId?: string | null) => {
+  const hasPendingCall = useCallback((callId?: string | null) => {
+    if (!callId) return false
     prunePendingCalls()
+    return pendingCallsRef.current.has(callId)
+  }, [prunePendingCalls])
+
+  const findPendingAnalyzeCall = useCallback((toolCallId?: string | null, snapshotId?: string | null, turnId?: string | null) => {
+    prunePendingCalls()
+    if (toolCallId) {
+      const byId = pendingCallsRef.current.get(toolCallId)
+      if (byId && byId.name === 'analyze_plant_snapshot') return byId
+    }
     for (const call of pendingCallsRef.current.values()) {
       if (call.name !== 'analyze_plant_snapshot') continue
       if (snapshotId && call.snapshotId === snapshotId) return call
@@ -421,7 +431,7 @@ export default function MainScreen() {
         analysis: result,
       }
 
-      if (callId) {
+      if (callId && hasPendingCall(callId)) {
         completeToolCall(callId, payload)
       } else if (summaryMode) {
         realtime.sendSystemEventSummary('Visual analysis completed.', payload)
@@ -435,7 +445,7 @@ export default function MainScreen() {
         analysisState: 'failed',
         lastAnalysisStatus: 'failed',
       }))
-      if (callId) {
+      if (callId && hasPendingCall(callId)) {
         completeToolCall(callId, {
           schemaVersion: '2.0',
           status: 'failed',
@@ -456,7 +466,7 @@ export default function MainScreen() {
     } finally {
       setIsAnalyzing(false)
     }
-  }, [completeToolCall, realtime, sessionId, updatePendingCall])
+  }, [completeToolCall, hasPendingCall, realtime, sessionId, updatePendingCall])
 
   const handleRequestPlantSnapshot = useCallback(async (callId: string, args: Record<string, unknown>) => {
     const reason = typeof args.reason === 'string' ? args.reason : 'visual inspection'
@@ -720,11 +730,18 @@ export default function MainScreen() {
     addEvent(msg)
     const type = msg.type as string | undefined
     const payload = (msg.payload as Record<string, unknown>) || {}
+    const toolCallId = typeof msg.toolCallId === 'string' ? msg.toolCallId : (typeof payload.toolCallId === 'string' ? payload.toolCallId : null)
     const snapshotId = typeof msg.snapshotId === 'string' ? msg.snapshotId : (typeof payload.snapshotId === 'string' ? payload.snapshotId : null)
     const turnId = typeof msg.turnId === 'string' ? msg.turnId : null
+    const activeTurnId = visualStateRef.current.activeTurnId
+    const activeSnapshotId = visualStateRef.current.activeSnapshotId
+    const matchesActiveVisualEvent =
+      (!turnId || !activeTurnId || turnId === activeTurnId) &&
+      (!snapshotId || !activeSnapshotId || snapshotId === activeSnapshotId)
 
     if (type === 'analysis.completed') {
-      const pending = findPendingAnalyzeCall(snapshotId, turnId)
+      if (!matchesActiveVisualEvent) return
+      const pending = findPendingAnalyzeCall(toolCallId, snapshotId, turnId)
       if (pending) {
         setAnalysis(payload as unknown as AnalysisResult)
         setStatus('analysis completed via ws')
@@ -741,12 +758,22 @@ export default function MainScreen() {
           correlationId: pending.correlationId,
           analysis: payload,
         })
+      } else {
+        if ((snapshotId && snapshotId === activeSnapshotId) || (turnId && turnId === activeTurnId)) {
+          realtime.sendSystemEventSummary('Visual analysis completed.', {
+            snapshotId: snapshotId || activeSnapshotId,
+            turnId: turnId || activeTurnId,
+            toolCallId,
+            analysis: payload,
+          })
+        }
       }
       return
     }
 
     if (type === 'analysis.failed') {
-      const pending = findPendingAnalyzeCall(snapshotId, turnId)
+      if (!matchesActiveVisualEvent) return
+      const pending = findPendingAnalyzeCall(toolCallId, snapshotId, turnId)
       setStatus(`analysis failed: ${payload.error || 'unknown'}`)
       setVisualState((prev) => ({
         ...prev,
@@ -762,6 +789,15 @@ export default function MainScreen() {
           correlationId: pending.correlationId,
           error: payload.error || 'unknown',
         })
+      } else {
+        if ((snapshotId && snapshotId === activeSnapshotId) || (turnId && turnId === activeTurnId)) {
+          realtime.sendSystemEventSummary('Visual analysis failed.', {
+            snapshotId: snapshotId || activeSnapshotId,
+            turnId: turnId || activeTurnId,
+            toolCallId,
+            error: payload.error || 'unknown',
+          })
+        }
       }
       return
     }
@@ -777,11 +813,13 @@ export default function MainScreen() {
     }
 
     if (type === 'capture.accepted') {
+      if (!matchesActiveVisualEvent) return
       setStatus('capture accepted by orchestrator')
       return
     }
 
     if (type === 'capture.rejected') {
+      if (!matchesActiveVisualEvent) return
       setStatus(`capture rejected: ${payload.reasonCode || 'unknown'}`)
       return
     }
@@ -794,6 +832,7 @@ export default function MainScreen() {
     }
 
     if (type === 'assistant.visual_guidance') {
+      if (!matchesActiveVisualEvent) return
       const guidance = (payload.text as string) || 'Try a different angle.'
       setStatus(`visual guidance: ${guidance}`)
       realtime.sendSystemEventSummary(guidance, { reasonCode: payload.reasonCode || null })

@@ -161,11 +161,16 @@ function buildToolReplyContextKey(toolCallId) {
   return `reply:tool:${toolCallId}`
 }
 
+function buildAnalysisRequestDedupeKey(sessionId, snapshotId, analysisGoal = 'diagnose') {
+  return `dedupe:analysis-requested:${sessionId}:${snapshotId}:${analysisGoal}`
+}
+
 function summarizeVisualState(event, previous = {}) {
   const payload = isObject(event.payload) ? event.payload : {}
   const next = {
     ...previous,
     sessionId: event.sessionId,
+    activeCorrelationId: event.correlationId || previous.activeCorrelationId || previous.lastCorrelationId || null,
     correlationId: event.correlationId || previous.correlationId || null,
     activeTurnId: event.turnId || previous.activeTurnId || null,
     activeSnapshotId: event.snapshotId || previous.activeSnapshotId || null,
@@ -194,18 +199,32 @@ function summarizeVisualState(event, previous = {}) {
       break
     case 'snapshot.uploaded':
       next.snapshotState = 'uploaded'
+      next.lastUploadedMessageId = event.messageId || previous.lastUploadedMessageId || null
+      next.lastUploadedCorrelationId = event.correlationId || previous.lastUploadedCorrelationId || null
+      next.lastUploadedTurnId = event.turnId || previous.lastUploadedTurnId || null
+      next.lastUploadedSnapshotId = event.snapshotId || previous.lastUploadedSnapshotId || null
       break
     case 'analysis.requested':
       next.analysisState = 'requested'
       next.snapshotState = 'analyzing'
+      next.analysisRequestedMessageId = event.messageId || previous.analysisRequestedMessageId || null
+      next.analysisRequestedCorrelationId = event.correlationId || previous.analysisRequestedCorrelationId || null
+      next.analysisRequestedTurnId = event.turnId || previous.analysisRequestedTurnId || null
+      next.analysisRequestedSnapshotId = event.snapshotId || previous.analysisRequestedSnapshotId || null
       break
     case 'analysis.completed':
       next.analysisState = 'completed'
       next.snapshotState = 'completed'
+      next.lastCompletedCorrelationId = event.correlationId || previous.lastCompletedCorrelationId || null
+      next.lastCompletedTurnId = event.turnId || previous.lastCompletedTurnId || null
+      next.lastCompletedSnapshotId = event.snapshotId || previous.lastCompletedSnapshotId || null
       break
     case 'analysis.failed':
       next.analysisState = 'failed'
       next.snapshotState = 'failed'
+      next.lastFailedCorrelationId = event.correlationId || previous.lastFailedCorrelationId || null
+      next.lastFailedTurnId = event.turnId || previous.lastFailedTurnId || null
+      next.lastFailedSnapshotId = event.snapshotId || previous.lastFailedSnapshotId || null
       break
     case 'assistant.visual_guidance':
       next.lastGuidance = payload.reasonCode || null
@@ -256,6 +275,168 @@ async function setToolReplyContext(client, value) {
     }),
     { EX: TOOL_REPLY_TTL_SEC }
   )
+}
+
+function getVisualTransitionError(state, event) {
+  const type = event?.type
+  if (
+    type !== 'snapshot.uploaded' &&
+    type !== 'analysis.requested' &&
+    type !== 'analysis.completed' &&
+    type !== 'analysis.failed'
+  ) {
+    return null
+  }
+
+  if (!state?.activeTurnId || !state?.activeSnapshotId) {
+    return {
+      status: 409,
+      code: 'orchestration_state_missing',
+      message: 'Visual analysis events require active orchestration state'
+    }
+  }
+
+  if (event.turnId && state.activeTurnId !== event.turnId) {
+    return {
+      status: 409,
+      code: 'turn_mismatch',
+      message: 'Visual analysis event turnId does not match orchestration state'
+    }
+  }
+
+  if (event.snapshotId && state.activeSnapshotId !== event.snapshotId) {
+    return {
+      status: 409,
+      code: 'snapshot_mismatch',
+      message: 'Visual analysis event snapshotId does not match orchestration state'
+    }
+  }
+
+  const expectedCorrelationId =
+    state.activeCorrelationId ||
+    state.lastCorrelationId ||
+    state.analysisRequestedCorrelationId ||
+    state.lastUploadedCorrelationId ||
+    state.lastCompletedCorrelationId ||
+    state.lastFailedCorrelationId ||
+    null
+  if (event.correlationId && expectedCorrelationId && expectedCorrelationId !== event.correlationId) {
+    return {
+      status: 409,
+      code: 'correlation_mismatch',
+      message: 'Visual analysis event correlationId does not match orchestration state'
+    }
+  }
+
+  if (type === 'snapshot.uploaded') {
+    const sameUpload =
+      state.lastUploadedCorrelationId === event.correlationId &&
+      state.lastUploadedTurnId === event.turnId &&
+      state.lastUploadedSnapshotId === event.snapshotId
+    const sameAnalysis =
+      state.analysisRequestedCorrelationId === event.correlationId &&
+      state.analysisRequestedTurnId === event.turnId &&
+      state.analysisRequestedSnapshotId === event.snapshotId
+    if (sameUpload || sameAnalysis) {
+      return null
+    }
+
+    const canUpload =
+      state.captureState === 'captured' ||
+      state.snapshotState === 'available' ||
+      state.snapshotState === 'uploading'
+    if (!canUpload) {
+      return {
+        status: 409,
+        code: 'invalid_visual_transition',
+        message: 'snapshot.uploaded requires a pending snapshot before analysis starts'
+      }
+    }
+  }
+
+  if (type === 'analysis.requested') {
+    const sameRequest =
+      state.analysisRequestedCorrelationId === event.correlationId &&
+      state.analysisRequestedTurnId === event.turnId &&
+      state.analysisRequestedSnapshotId === event.snapshotId
+    if (sameRequest) {
+      return null
+    }
+
+    const sameUploadedSnapshot =
+      state.lastUploadedCorrelationId === event.correlationId &&
+      state.lastUploadedTurnId === event.turnId &&
+      state.lastUploadedSnapshotId === event.snapshotId
+    if (!sameUploadedSnapshot || state.snapshotState !== 'uploaded') {
+      return {
+        status: 409,
+        code: 'invalid_visual_transition',
+        message: 'analysis.requested requires the same snapshot to be uploaded first'
+      }
+    }
+
+    if (state.analysisState === 'requested' || state.analysisState === 'completed' || state.analysisState === 'failed') {
+      return {
+        status: 409,
+        code: 'invalid_visual_transition',
+        message: 'analysis.requested already exists for this snapshot'
+      }
+    }
+  }
+
+  if (type === 'analysis.completed' || type === 'analysis.failed') {
+    const canResolve =
+      state.analysisState === 'requested' ||
+      state.analysisState === 'completed' ||
+      state.analysisState === 'failed'
+
+    if (!canResolve) {
+      return {
+        status: 409,
+        code: 'invalid_visual_transition',
+        message: `${type} requires an active analysis request`
+      }
+    }
+  }
+
+  return null
+}
+
+function matchesVisualStateForReply(state, expected) {
+  if (!state || typeof state !== 'object') return false
+  const correlationMatch =
+    !expected.correlationId ||
+    state.lastCompletedCorrelationId === expected.correlationId ||
+    state.lastFailedCorrelationId === expected.correlationId ||
+    state.analysisRequestedCorrelationId === expected.correlationId ||
+    state.lastUploadedCorrelationId === expected.correlationId ||
+    state.lastCorrelationId === expected.correlationId
+  if (!correlationMatch) return false
+
+  const turnMatch =
+    !expected.turnId ||
+    state.lastCompletedTurnId === expected.turnId ||
+    state.lastFailedTurnId === expected.turnId ||
+    state.analysisRequestedTurnId === expected.turnId ||
+    state.activeTurnId === expected.turnId
+  if (!turnMatch) return false
+
+  const snapshotMatch =
+    !expected.snapshotId ||
+    state.lastCompletedSnapshotId === expected.snapshotId ||
+    state.lastFailedSnapshotId === expected.snapshotId ||
+    state.analysisRequestedSnapshotId === expected.snapshotId ||
+    state.lastUploadedSnapshotId === expected.snapshotId ||
+    state.activeSnapshotId === expected.snapshotId
+  if (!snapshotMatch) return false
+
+  if (
+    expected.toolCallId &&
+    state.lastToolCallId !== expected.toolCallId
+  ) {
+    return false
+  }
+  return true
 }
 
 function visualSessionStateKey(sessionId) {
@@ -373,6 +554,28 @@ async function drainPendingStreamMessages(client, stream, group, consumerName, c
 async function processOrchestratorMessage(client, msg) {
   const payload = JSON.parse(msg.message.payload || '{}')
   if (payload.type === 'analysis.requested') {
+    const currentState = await getVisualSessionState(client, payload.sessionId)
+    const sameRequestAlreadyStarted =
+      currentState?.analysisRequestedCorrelationId === payload.correlationId &&
+      currentState?.analysisRequestedTurnId === (payload.turnId || payload?.payload?.turnId || null) &&
+      currentState?.analysisRequestedSnapshotId === (payload.snapshotId || payload?.payload?.snapshotId || null) &&
+      (
+        currentState?.analysisState === 'requested' ||
+        currentState?.analysisState === 'completed' ||
+        currentState?.analysisState === 'failed'
+      )
+    if (sameRequestAlreadyStarted) {
+      orchestratorLogger.info('Skipping duplicate analysis.requested', {
+        sessionId: payload.sessionId,
+        messageId: payload.messageId,
+        correlationId: payload.correlationId || null,
+        turnId: payload.turnId || payload?.payload?.turnId || null,
+        snapshotId: payload.snapshotId || payload?.payload?.snapshotId || null
+      })
+      await client.xAck(SESSION_EVENTS_STREAM, ORCHESTRATOR_GROUP, msg.id)
+      return
+    }
+
     const attempt = payload?.payload?.attempt || 1
     const analysisGoal = payload?.payload?.analysisGoal || null
     const toolCallId = payload?.payload?.toolCallId || payload?.payload?.callId || payload.causationId || null
@@ -384,14 +587,18 @@ async function processOrchestratorMessage(client, msg) {
       snapshotId: payload.snapshotId || payload?.payload?.snapshotId || null,
       attempt
     })
-    const currentState = await getVisualSessionState(client, payload.sessionId)
     const nextState = {
       ...(currentState || {}),
       sessionId: payload.sessionId,
+      activeCorrelationId: payload.correlationId || currentState?.activeCorrelationId || null,
       activeTurnId: payload.turnId || payload?.payload?.turnId || currentState?.activeTurnId || null,
       activeSnapshotId: payload.snapshotId || payload?.payload?.snapshotId || currentState?.activeSnapshotId || null,
       lastToolCallId: toolCallId || currentState?.lastToolCallId || null,
       lastCorrelationId: payload.correlationId || currentState?.lastCorrelationId || null,
+      analysisRequestedMessageId: payload.messageId,
+      analysisRequestedCorrelationId: payload.correlationId || currentState?.analysisRequestedCorrelationId || null,
+      analysisRequestedTurnId: payload.turnId || payload?.payload?.turnId || currentState?.analysisRequestedTurnId || null,
+      analysisRequestedSnapshotId: payload.snapshotId || payload?.payload?.snapshotId || currentState?.analysisRequestedSnapshotId || null,
       analysisGoal: analysisGoal || currentState?.analysisGoal || null,
       analysisState: 'requested',
       updatedAt: new Date().toISOString()
@@ -512,8 +719,50 @@ async function processOrchestratorMessage(client, msg) {
       snapshotId: payload.snapshotId || null
     })
   } else if (payload.type === 'snapshot.uploaded') {
-    await persistVisualState(client, payload)
     const currentState = await getVisualSessionState(client, payload.sessionId)
+    const nextState = await persistVisualState(client, payload)
+    const analysisGoal = payload?.payload?.analysisGoal || nextState?.analysisGoal || currentState?.analysisGoal || 'diagnose'
+    const sameRequestAlreadyStarted =
+      nextState?.analysisRequestedCorrelationId === (payload.correlationId || payload.messageId) &&
+      nextState?.analysisRequestedTurnId === (payload.turnId || nextState?.activeTurnId || currentState?.activeTurnId || null) &&
+      nextState?.analysisRequestedSnapshotId === (payload.snapshotId || nextState?.activeSnapshotId || currentState?.activeSnapshotId || null) &&
+      (
+        nextState?.analysisState === 'requested' ||
+        nextState?.analysisState === 'completed' ||
+        nextState?.analysisState === 'failed'
+      )
+    if (sameRequestAlreadyStarted) {
+      orchestratorLogger.info('Skipping duplicate snapshot.uploaded after analysis.requested', {
+        sessionId: payload.sessionId,
+        correlationId: payload.correlationId || payload.messageId,
+        turnId: payload.turnId || nextState?.activeTurnId || currentState?.activeTurnId || null,
+        snapshotId: payload.snapshotId || nextState?.activeSnapshotId || currentState?.activeSnapshotId || null,
+        analysisGoal
+      })
+      await client.xAck(SESSION_EVENTS_STREAM, ORCHESTRATOR_GROUP, msg.id)
+      return
+    }
+
+    const dedupeKey = buildAnalysisRequestDedupeKey(
+      payload.sessionId,
+      payload.snapshotId || nextState?.activeSnapshotId || currentState?.activeSnapshotId || 'unknown',
+      analysisGoal
+    )
+    const shouldDispatch = await client.set(dedupeKey, payload.messageId, {
+      NX: true,
+      EX: TOOL_REPLY_TTL_SEC
+    })
+    if (!shouldDispatch) {
+      orchestratorLogger.info('Skipped duplicate analysis.requested fan-out from snapshot.uploaded', {
+        sessionId: payload.sessionId,
+        correlationId: payload.correlationId || payload.messageId,
+        turnId: payload.turnId || currentState?.activeTurnId || null,
+        snapshotId: payload.snapshotId || currentState?.activeSnapshotId || null,
+        analysisGoal
+      })
+      await client.xAck(SESSION_EVENTS_STREAM, ORCHESTRATOR_GROUP, msg.id)
+      return
+    }
     const analysisRequested = {
       messageId: crypto.randomUUID(),
       type: 'analysis.requested',
@@ -521,15 +770,15 @@ async function processOrchestratorMessage(client, msg) {
       userId: payload.userId || null,
       correlationId: payload.correlationId || payload.messageId,
       causationId: payload.causationId || payload.messageId,
-      turnId: payload.turnId || currentState?.activeTurnId || null,
-      snapshotId: payload.snapshotId || currentState?.activeSnapshotId || null,
+      turnId: payload.turnId || nextState?.activeTurnId || currentState?.activeTurnId || null,
+      snapshotId: payload.snapshotId || nextState?.activeSnapshotId || currentState?.activeSnapshotId || null,
       tsWallIso: new Date().toISOString(),
       schemaVersion: payload.schemaVersion || '2.0',
       payload: {
         imageArtifactKey: payload?.payload?.artifactKey || null,
         replyKey: payload?.payload?.replyKey || null,
         toolCallId: payload?.payload?.toolCallId || null,
-        analysisGoal: payload?.payload?.analysisGoal || currentState?.analysisGoal || 'diagnose',
+        analysisGoal,
         attempt: 1
       }
     }
@@ -615,6 +864,9 @@ async function processOrchestratorMessage(client, msg) {
         analysisState: 'failed',
         lastAnalysisStatus: 'failed',
         lastAnalysisError: payload?.payload?.error || 'unknown',
+        lastFailedCorrelationId: payload.correlationId || state.lastFailedCorrelationId || null,
+        lastFailedTurnId: payload.turnId || state.lastFailedTurnId || null,
+        lastFailedSnapshotId: payload.snapshotId || state.lastFailedSnapshotId || null,
         updatedAt: new Date().toISOString()
       })
     }
@@ -799,6 +1051,9 @@ async function processVisionCommand(client, event) {
         analysisState: 'completed',
         lastAnalysisStatus: 'completed',
         lastToolCallId: command.toolCallId || state.lastToolCallId || null,
+        lastCompletedCorrelationId: event.correlationId || state.lastCompletedCorrelationId || null,
+        lastCompletedTurnId: resultEvent.turnId || state.lastCompletedTurnId || null,
+        lastCompletedSnapshotId: resultEvent.snapshotId || state.lastCompletedSnapshotId || null,
         lastAnalysis: analysis,
         updatedAt: new Date().toISOString()
       })
@@ -887,6 +1142,9 @@ async function processVisionCommand(client, event) {
         analysisState: 'failed',
         lastAnalysisStatus: 'failed',
         lastToolCallId: command.toolCallId || state.lastToolCallId || null,
+        lastFailedCorrelationId: event.correlationId || state.lastFailedCorrelationId || null,
+        lastFailedTurnId: failedResult.turnId || state.lastFailedTurnId || null,
+        lastFailedSnapshotId: failedResult.snapshotId || state.lastFailedSnapshotId || null,
         lastAnalysisError: err.message,
         updatedAt: new Date().toISOString()
       })
@@ -1260,9 +1518,9 @@ app.post('/api/analyze-image', upload.single('image'), async (req, res) => {
     await redis.set(imageArtifactKey, buildDataUrlFromUpload(req.file), { EX: imageTtl })
     await setVisualSessionState(redis, sessionId, {
       sessionId,
+      activeCorrelationId: correlationId,
       activeTurnId: turnId,
       activeSnapshotId: snapshotId,
-      analysisState: 'requested',
       analysisGoal,
       snapshotState: 'uploaded',
       lastToolCallId: toolCallId,
@@ -1317,34 +1575,6 @@ app.post('/api/analyze-image', upload.single('image'), async (req, res) => {
 
     const startedAt = Date.now()
     while (Date.now() - startedAt < ANALYSIS_WAIT_TIMEOUT_MS) {
-      const state = await getVisualSessionState(redis, event.sessionId)
-      if (state?.analysisState === 'completed' && state?.lastAnalysis) {
-        await redis.del(replyKey)
-        appLogger.info('Analysis request completed from orchestration state', {
-          requestId: req.requestId,
-          sessionId: event.sessionId,
-          correlationId: event.correlationId,
-          durationMs: Date.now() - startedAt
-        })
-        return res.json(state.lastAnalysis)
-      }
-      if (state?.analysisState === 'failed' && state?.lastAnalysisError) {
-        await redis.del(replyKey)
-        appLogger.warn('Analysis request failed from orchestration state', {
-          requestId: req.requestId,
-          sessionId: event.sessionId,
-          correlationId: event.correlationId,
-          details: state.lastAnalysisError
-        })
-        return sendError(
-          res,
-          502,
-          'analysis_failed',
-          'Analysis failed after retries',
-          req.requestId,
-          state.lastAnalysisError
-        )
-      }
       const raw = await redis.get(replyKey)
       if (raw) {
         await redis.del(replyKey)
@@ -1372,6 +1602,36 @@ app.post('/api/analyze-image', upload.single('image'), async (req, res) => {
           durationMs: Date.now() - startedAt
         })
         return res.json(parsed)
+      }
+      const state = await getVisualSessionState(redis, event.sessionId)
+      if (matchesVisualStateForReply(state, { correlationId, turnId, snapshotId, toolCallId })) {
+        if (state?.analysisState === 'completed' && state?.lastAnalysis) {
+          await redis.del(replyKey)
+          appLogger.info('Analysis request completed from orchestration state', {
+            requestId: req.requestId,
+            sessionId: event.sessionId,
+            correlationId: event.correlationId,
+            durationMs: Date.now() - startedAt
+          })
+          return res.json(state.lastAnalysis)
+        }
+        if (state?.analysisState === 'failed' && state?.lastAnalysisError) {
+          await redis.del(replyKey)
+          appLogger.warn('Analysis request failed from orchestration state', {
+            requestId: req.requestId,
+            sessionId: event.sessionId,
+            correlationId: event.correlationId,
+            details: state.lastAnalysisError
+          })
+          return sendError(
+            res,
+            502,
+            'analysis_failed',
+            'Analysis failed after retries',
+            req.requestId,
+            state.lastAnalysisError
+          )
+        }
       }
       await sleep(200)
     }
@@ -1407,23 +1667,20 @@ async function handleEventIngestRequest(req, res, deps = {}) {
     return sendError(res, 400, 'invalid_event_envelope', validationError, req.requestId)
   }
 
-  if (req.body.type === 'analysis.completed' || req.body.type === 'analysis.failed') {
+  if (
+    req.body.type === 'snapshot.uploaded' ||
+    req.body.type === 'analysis.requested' ||
+    req.body.type === 'analysis.completed' ||
+    req.body.type === 'analysis.failed'
+  ) {
     const visualState = await getVisualSessionState(redisClient, req.body.sessionId)
-    if (!visualState?.activeTurnId) {
+    const transitionError = getVisualTransitionError(visualState, req.body)
+    if (transitionError) {
       return sendError(
         res,
-        409,
-        'orchestration_state_missing',
-        'Visual analysis events require active orchestration state',
-        req.requestId
-      )
-    }
-    if (req.body.turnId && visualState.activeTurnId !== req.body.turnId) {
-      return sendError(
-        res,
-        409,
-        'turn_mismatch',
-        'Visual analysis event turnId does not match orchestration state',
+        transitionError.status,
+        transitionError.code,
+        transitionError.message,
         req.requestId
       )
     }
@@ -1525,8 +1782,10 @@ module.exports = {
   app,
   drainPendingStreamMessages,
   enqueueSessionEventAtomically,
+  getVisualTransitionError,
   REALTIME_TOKEN_AUTH_HEADER,
   handleEventIngestRequest,
+  matchesVisualStateForReply,
   processVisionCommand,
   handleRealtimeTokenRequest,
   processOrchestratorMessage,
