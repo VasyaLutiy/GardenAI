@@ -47,6 +47,7 @@ const SESSION_EVENTS_STREAM = 'stream:session-events'
 const VISION_COMMANDS_STREAM = 'stream:vision-commands'
 const ANALYSIS_RESULTS_STREAM = 'stream:analysis-results'
 const DLQ_STREAM = 'stream:dlq'
+const VISUAL_SESSION_STATE_PREFIX = 'state:session-visual:'
 const ORCHESTRATOR_GROUP = 'orchestrator-group'
 const VISION_GROUP = 'vision-group'
 const PENDING_MIN_IDLE_MS = Number(process.env.PENDING_MIN_IDLE_MS || 60000)
@@ -62,6 +63,8 @@ const LOG_JSON = process.env.LOG_JSON !== '0'
 const INTENT_CAPTURE_CONFIDENCE_THRESHOLD = Number(process.env.INTENT_CAPTURE_CONFIDENCE_THRESHOLD || 0.65)
 const INTENT_CAPTURE_COOLDOWN_SEC = Number(process.env.INTENT_CAPTURE_COOLDOWN_SEC || 8)
 const ANALYSIS_FAIL_FALLBACK_LIMIT = Number(process.env.ANALYSIS_FAIL_FALLBACK_LIMIT || 2)
+const VISUAL_STATE_TTL_SEC = Number(process.env.VISUAL_STATE_TTL_SEC || 1800)
+const TOOL_REPLY_TTL_SEC = Number(process.env.TOOL_REPLY_TTL_SEC || 120)
 
 const redis = createClient({ url: REDIS_URL })
 let redisReady = false
@@ -138,12 +141,126 @@ function buildDataUrlFromUpload(file) {
   return `data:${mime};base64,${b64}`
 }
 
+function isObject(value) {
+  return !!value && typeof value === 'object' && !Array.isArray(value)
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
 function recordMetric(name) {
   metrics[name] = (metrics[name] || 0) + 1
+}
+
+function buildVisualStateKey(sessionId) {
+  return `${VISUAL_SESSION_STATE_PREFIX}${sessionId}`
+}
+
+function buildToolReplyContextKey(toolCallId) {
+  return `reply:tool:${toolCallId}`
+}
+
+function summarizeVisualState(event, previous = {}) {
+  const payload = isObject(event.payload) ? event.payload : {}
+  const next = {
+    ...previous,
+    sessionId: event.sessionId,
+    correlationId: event.correlationId || previous.correlationId || null,
+    activeTurnId: event.turnId || previous.activeTurnId || null,
+    activeSnapshotId: event.snapshotId || previous.activeSnapshotId || null,
+    analysisGoal: payload.analysisGoal || previous.analysisGoal || null,
+    toolCallId: payload.toolCallId || previous.toolCallId || null,
+    lastEventType: event.type,
+    updatedAt: event.tsWallIso || new Date().toISOString(),
+  }
+
+  switch (event.type) {
+    case 'capture.requested':
+      next.captureState = 'requested'
+      break
+    case 'capture.accepted':
+      next.captureState = 'captured'
+      break
+    case 'capture.rejected':
+      next.captureState = 'failed'
+      break
+    case 'analysis.requested':
+      next.analysisState = 'requested'
+      break
+    case 'analysis.completed':
+      next.analysisState = 'completed'
+      break
+    case 'analysis.failed':
+      next.analysisState = 'failed'
+      break
+    case 'assistant.visual_guidance':
+      next.lastGuidance = payload.reasonCode || null
+      break
+    default:
+      break
+  }
+
+  return next
+}
+
+async function persistVisualState(client, event) {
+  if (!client || typeof client.get !== 'function' || typeof client.set !== 'function' || !event?.sessionId) {
+    return null
+  }
+
+  const key = buildVisualStateKey(event.sessionId)
+  let previous = {}
+  const raw = await client.get(key)
+  if (raw) {
+    try {
+      previous = JSON.parse(raw)
+    } catch {
+      previous = {}
+    }
+  }
+  const next = summarizeVisualState(event, isObject(previous) ? previous : {})
+  await client.set(key, JSON.stringify(next), { EX: VISUAL_STATE_TTL_SEC })
+  return next
+}
+
+async function setToolReplyContext(client, value) {
+  if (!client || typeof client.set !== 'function' || !value?.toolCallId) {
+    return
+  }
+
+  await client.set(
+    buildToolReplyContextKey(value.toolCallId),
+    JSON.stringify({
+      toolCallId: value.toolCallId,
+      sessionId: value.sessionId,
+      correlationId: value.correlationId || null,
+      turnId: value.turnId || null,
+      snapshotId: value.snapshotId || null,
+      analysisGoal: value.analysisGoal || null,
+      status: value.status || 'pending',
+      updatedAt: new Date().toISOString(),
+    }),
+    { EX: TOOL_REPLY_TTL_SEC }
+  )
+}
+
+function visualSessionStateKey(sessionId) {
+  return buildVisualStateKey(sessionId)
+}
+
+async function getVisualSessionState(client, sessionId) {
+  const raw = await client.get(visualSessionStateKey(sessionId))
+  if (!raw) return null
+  try {
+    return JSON.parse(raw)
+  } catch {
+    return null
+  }
+}
+
+async function setVisualSessionState(client, sessionId, state, ttlSeconds = VISUAL_STATE_TTL_SEC) {
+  await client.set(visualSessionStateKey(sessionId), JSON.stringify(state), { EX: ttlSeconds })
 }
 
 async function publishSessionEvent(client, event) {
@@ -244,25 +361,57 @@ async function processOrchestratorMessage(client, msg) {
   const payload = JSON.parse(msg.message.payload || '{}')
   if (payload.type === 'analysis.requested') {
     const attempt = payload?.payload?.attempt || 1
+    const analysisGoal = payload?.payload?.analysisGoal || null
+    const toolCallId = payload?.payload?.toolCallId || payload?.payload?.callId || payload.causationId || null
     orchestratorLogger.info('Dispatching vision analyze command', {
       sessionId: payload.sessionId,
       messageId: payload.messageId,
       correlationId: payload.correlationId || null,
+      turnId: payload.turnId || payload?.payload?.turnId || null,
+      snapshotId: payload.snapshotId || payload?.payload?.snapshotId || null,
       attempt
+    })
+    const currentState = await getVisualSessionState(client, payload.sessionId)
+    const nextState = {
+      ...(currentState || {}),
+      sessionId: payload.sessionId,
+      activeTurnId: payload.turnId || payload?.payload?.turnId || currentState?.activeTurnId || null,
+      activeSnapshotId: payload.snapshotId || payload?.payload?.snapshotId || currentState?.activeSnapshotId || null,
+      lastToolCallId: toolCallId || currentState?.lastToolCallId || null,
+      lastCorrelationId: payload.correlationId || currentState?.lastCorrelationId || null,
+      analysisGoal: analysisGoal || currentState?.analysisGoal || null,
+      analysisState: 'requested',
+      updatedAt: new Date().toISOString()
+    }
+    await setVisualSessionState(client, payload.sessionId, nextState)
+    await setToolReplyContext(client, {
+      toolCallId,
+      sessionId: payload.sessionId,
+      correlationId: payload.correlationId || payload.messageId,
+      turnId: nextState.activeTurnId,
+      snapshotId: nextState.activeSnapshotId,
+      analysisGoal,
+      status: 'pending'
     })
     const commandEvent = {
       messageId: crypto.randomUUID(),
       type: 'vision.analyze.command',
       sessionId: payload.sessionId,
       userId: payload.userId || null,
-      correlationId: payload.messageId,
+      correlationId: payload.correlationId || payload.messageId,
       causationId: payload.messageId,
-      schemaVersion: '1.0',
+      turnId: nextState.activeTurnId,
+      snapshotId: nextState.activeSnapshotId,
+      schemaVersion: payload.schemaVersion || '2.0',
       payload: {
         requestMessageId: payload.messageId,
         imageDataUrl: payload?.payload?.imageDataUrl,
         imageArtifactKey: payload?.payload?.imageArtifactKey,
         replyKey: payload?.payload?.replyKey,
+        snapshotId: nextState.activeSnapshotId,
+        turnId: nextState.activeTurnId,
+        toolCallId,
+        analysisGoal,
         attempt
       }
     }
@@ -288,9 +437,13 @@ async function processOrchestratorMessage(client, msg) {
         EX: INTENT_CAPTURE_COOLDOWN_SEC
       })
       if (cooldownSet) {
+        const turnId = crypto.randomUUID()
+        const snapshotId = crypto.randomUUID()
         orchestratorLogger.info('Emitting capture.requested from intent', {
           sessionId: payload.sessionId,
           correlationId: payload.correlationId || payload.messageId,
+          turnId,
+          snapshotId,
           detectedIntent,
           confidence
         })
@@ -300,11 +453,13 @@ async function processOrchestratorMessage(client, msg) {
           sessionId: payload.sessionId,
           correlationId: payload.correlationId || payload.messageId,
           causationId: payload.messageId,
-          schemaVersion: '1.0',
+          turnId,
+          snapshotId,
+          schemaVersion: '2.0',
           tsWallIso: new Date().toISOString(),
           payload: {
             reason: `intent:${detectedIntent}`,
-            mode: 'auto',
+            captureMode: 'fresh_photo',
             requestedBy: 'orchestrator'
           }
         }
@@ -334,8 +489,42 @@ async function processOrchestratorMessage(client, msg) {
         confidence
       })
     }
+  } else if (payload.type === 'capture.requested' || payload.type === 'capture.accepted' || payload.type === 'capture.rejected') {
+    await persistVisualState(client, payload)
+    orchestratorLogger.info('Visual capture lifecycle updated', {
+      sessionId: payload.sessionId,
+      eventType: payload.type,
+      correlationId: payload.correlationId || null,
+      turnId: payload.turnId || null,
+      snapshotId: payload.snapshotId || null
+    })
+  } else if (payload.type === 'analysis.completed') {
+    await persistVisualState(client, payload)
+    await setToolReplyContext(client, {
+      toolCallId: payload.toolCallId || payload?.payload?.toolCallId || null,
+      sessionId: payload.sessionId,
+      correlationId: payload.correlationId || payload.messageId,
+      turnId: payload.turnId || null,
+      snapshotId: payload.snapshotId || null,
+      status: 'completed'
+    })
+    orchestratorLogger.info('Visual analysis completed', {
+      sessionId: payload.sessionId,
+      correlationId: payload.correlationId || null,
+      turnId: payload.turnId || null,
+      snapshotId: payload.snapshotId || null
+    })
   } else if (payload.type === 'analysis.failed') {
+    await persistVisualState(client, payload)
     const corr = payload.correlationId || payload.messageId
+    await setToolReplyContext(client, {
+      toolCallId: payload.toolCallId || payload?.payload?.toolCallId || null,
+      sessionId: payload.sessionId,
+      correlationId: corr,
+      turnId: payload.turnId || null,
+      snapshotId: payload.snapshotId || null,
+      status: 'failed'
+    })
     const failCountKey = `orchestrator:analysis-fail-count:${corr}`
     const count = await client.incr(failCountKey)
     if (count === 1) {
@@ -344,24 +533,38 @@ async function processOrchestratorMessage(client, msg) {
     if (count <= ANALYSIS_FAIL_FALLBACK_LIMIT) {
       const promptEvent = {
         messageId: crypto.randomUUID(),
-        type: 'assistant.prompt',
+        type: 'assistant.visual_guidance',
         sessionId: payload.sessionId,
         correlationId: corr,
         causationId: payload.messageId,
-        schemaVersion: '1.0',
+        turnId: payload.turnId || null,
+        snapshotId: payload.snapshotId || null,
+        schemaVersion: '2.0',
         tsWallIso: new Date().toISOString(),
         payload: {
-          text: 'I could not analyze the photo. Please retake with better lighting and closer focus on the leaves.',
+          text: 'I could not analyze the photo. Please retake it with better lighting and closer focus on the leaves.',
           reasonCode: 'analysis_failed'
         }
       }
       recordMetric('promptFallbackCount')
       await publishSessionEvent(client, promptEvent)
-      orchestratorLogger.warn('Emitting assistant.prompt after analysis failure', {
+      orchestratorLogger.warn('Emitting assistant.visual_guidance after analysis failure', {
         sessionId: payload.sessionId,
         correlationId: corr,
+        turnId: payload.turnId || null,
+        snapshotId: payload.snapshotId || null,
         failureCount: count,
         error: payload?.payload?.error || 'unknown'
+      })
+    }
+    const state = await getVisualSessionState(client, payload.sessionId)
+    if (state) {
+      await setVisualSessionState(client, payload.sessionId, {
+        ...state,
+        analysisState: 'failed',
+        lastAnalysisStatus: 'failed',
+        lastAnalysisError: payload?.payload?.error || 'unknown',
+        updatedAt: new Date().toISOString()
       })
     }
   }
@@ -524,7 +727,10 @@ async function processVisionCommand(client, event) {
       sessionId: event.sessionId,
       correlationId: event.correlationId,
       causationId: event.messageId,
-      schemaVersion: '1.0',
+      schemaVersion: event.schemaVersion || '2.0',
+      turnId: event.turnId || command.turnId || null,
+      snapshotId: event.snapshotId || command.snapshotId || null,
+      toolCallId: command.toolCallId || null,
       payload: analysis
     }
 
@@ -535,14 +741,36 @@ async function processVisionCommand(client, event) {
       payload: JSON.stringify(resultEvent)
     })
     recordMetric('analysisCompleted')
+    const state = await getVisualSessionState(client, event.sessionId)
+    if (state) {
+      await setVisualSessionState(client, event.sessionId, {
+        ...state,
+        analysisState: 'completed',
+        lastAnalysisStatus: 'completed',
+        lastToolCallId: command.toolCallId || state.lastToolCallId || null,
+        lastAnalysis: analysis,
+        updatedAt: new Date().toISOString()
+      })
+    }
     visionLogger.info('Vision analysis completed', {
       sessionId: event.sessionId,
       correlationId: event.correlationId || null,
       resultMessageId: resultEvent.messageId
     })
-    await client.publish(`chan:session:${event.sessionId}`, JSON.stringify(resultEvent))
+    await publishSessionEvent(client, resultEvent)
     if (command.replyKey) {
-      await client.set(command.replyKey, JSON.stringify(analysis), { EX: 120 })
+      await client.set(command.replyKey, JSON.stringify(analysis), { EX: TOOL_REPLY_TTL_SEC })
+    }
+    if (command.toolCallId) {
+      await setToolReplyContext(client, {
+        toolCallId: command.toolCallId,
+        sessionId: event.sessionId,
+        correlationId: event.correlationId || null,
+        turnId: resultEvent.turnId,
+        snapshotId: resultEvent.snapshotId,
+        analysisGoal: command.analysisGoal || null,
+        status: 'completed'
+      })
     }
     if (command.imageArtifactKey) {
       await client.del(command.imageArtifactKey)
@@ -586,8 +814,13 @@ async function processVisionCommand(client, event) {
       sessionId: event.sessionId,
       correlationId: event.correlationId,
       causationId: event.messageId,
-      schemaVersion: '1.0',
-      payload: { error: err.message }
+      schemaVersion: event.schemaVersion || '2.0',
+      turnId: event.turnId || command.turnId || null,
+      snapshotId: event.snapshotId || command.snapshotId || null,
+      toolCallId: command.toolCallId || null,
+      payload: {
+        error: err.message
+      }
     }
     await client.xAdd(ANALYSIS_RESULTS_STREAM, '*', {
       messageId: failedResult.messageId,
@@ -596,6 +829,17 @@ async function processVisionCommand(client, event) {
       payload: JSON.stringify(failedResult)
     })
     recordMetric('analysisFailed')
+    const state = await getVisualSessionState(client, event.sessionId)
+    if (state) {
+      await setVisualSessionState(client, event.sessionId, {
+        ...state,
+        analysisState: 'failed',
+        lastAnalysisStatus: 'failed',
+        lastToolCallId: command.toolCallId || state.lastToolCallId || null,
+        lastAnalysisError: err.message,
+        updatedAt: new Date().toISOString()
+      })
+    }
     await client.xAdd(DLQ_STREAM, '*', {
       messageId: failedResult.messageId,
       sessionId: failedResult.sessionId,
@@ -611,8 +855,19 @@ async function processVisionCommand(client, event) {
       await client.set(
         command.replyKey,
         JSON.stringify({ error: 'Analysis failed after retries', details: err.message }),
-        { EX: 120 }
+        { EX: TOOL_REPLY_TTL_SEC }
       )
+    }
+    if (command.toolCallId) {
+      await setToolReplyContext(client, {
+        toolCallId: command.toolCallId,
+        sessionId: event.sessionId,
+        correlationId: event.correlationId || null,
+        turnId: failedResult.turnId,
+        snapshotId: failedResult.snapshotId,
+        analysisGoal: command.analysisGoal || null,
+        status: 'failed'
+      })
     }
     if (command.imageArtifactKey) {
       await client.del(command.imageArtifactKey)
@@ -938,24 +1193,63 @@ app.post('/api/analyze-image', upload.single('image'), async (req, res) => {
   try {
     recordMetric('analyzeRequests')
     const messageId = crypto.randomUUID()
+    const sessionId = req.body?.sessionId || `upload-${messageId}`
+    const correlationId = req.body?.correlationId || null
+    const causationId = req.body?.causationId || req.requestId
+    const turnId = req.body?.turnId || null
+    const snapshotId = req.body?.snapshotId || null
+    const toolCallId = req.body?.toolCallId || null
+    const analysisGoal = req.body?.analysisGoal || 'diagnose'
+    if (!correlationId || !turnId || !snapshotId) {
+      return sendError(
+        res,
+        400,
+        'missing_visual_context',
+        'correlationId, turnId and snapshotId are required',
+        req.requestId
+      )
+    }
     const replyKey = `analysis:reply:${messageId}`
     const imageArtifactKey = `artifact:image:${messageId}`
     const imageTtl = RETENTION_HOURS * 60 * 60
     await redis.set(imageArtifactKey, buildDataUrlFromUpload(req.file), { EX: imageTtl })
+    await setVisualSessionState(redis, sessionId, {
+      sessionId,
+      activeTurnId: turnId,
+      activeSnapshotId: snapshotId,
+      analysisState: 'requested',
+      analysisGoal,
+      lastToolCallId: toolCallId,
+      lastCorrelationId: correlationId,
+      updatedAt: new Date().toISOString()
+    })
+    await setToolReplyContext(redis, {
+      toolCallId,
+      sessionId,
+      correlationId,
+      turnId,
+      snapshotId,
+      analysisGoal,
+      status: 'pending'
+    })
     const event = {
       messageId,
       type: 'analysis.requested',
-      sessionId: req.body?.sessionId || `upload-${messageId}`,
+      sessionId,
       userId: req.body?.userId || null,
       seq: null,
       tsMonotonicMs: null,
       tsWallIso: new Date().toISOString(),
-      correlationId: req.body?.correlationId || messageId,
-      causationId: req.body?.causationId || req.requestId,
-      schemaVersion: '1.0',
+      correlationId,
+      causationId,
+      turnId,
+      snapshotId,
+      schemaVersion: '2.0',
       payload: {
         imageArtifactKey,
         replyKey,
+        toolCallId,
+        analysisGoal,
         attempt: 1
       }
     }
@@ -963,13 +1257,44 @@ app.post('/api/analyze-image', upload.single('image'), async (req, res) => {
       requestId: req.requestId,
       sessionId: event.sessionId,
       messageId,
-      correlationId: event.correlationId
+      correlationId: event.correlationId,
+      turnId,
+      snapshotId,
+      toolCallId
     })
 
     await publishSessionEvent(redis, event)
 
     const startedAt = Date.now()
     while (Date.now() - startedAt < ANALYSIS_WAIT_TIMEOUT_MS) {
+      const state = await getVisualSessionState(redis, event.sessionId)
+      if (state?.analysisState === 'completed' && state?.lastAnalysis) {
+        await redis.del(replyKey)
+        appLogger.info('Analysis request completed from orchestration state', {
+          requestId: req.requestId,
+          sessionId: event.sessionId,
+          correlationId: event.correlationId,
+          durationMs: Date.now() - startedAt
+        })
+        return res.json(state.lastAnalysis)
+      }
+      if (state?.analysisState === 'failed' && state?.lastAnalysisError) {
+        await redis.del(replyKey)
+        appLogger.warn('Analysis request failed from orchestration state', {
+          requestId: req.requestId,
+          sessionId: event.sessionId,
+          correlationId: event.correlationId,
+          details: state.lastAnalysisError
+        })
+        return sendError(
+          res,
+          502,
+          'analysis_failed',
+          'Analysis failed after retries',
+          req.requestId,
+          state.lastAnalysisError
+        )
+      }
       const raw = await redis.get(replyKey)
       if (raw) {
         await redis.del(replyKey)
@@ -1032,6 +1357,28 @@ async function handleEventIngestRequest(req, res, deps = {}) {
     return sendError(res, 400, 'invalid_event_envelope', validationError, req.requestId)
   }
 
+  if (req.body.type === 'analysis.completed' || req.body.type === 'analysis.failed') {
+    const visualState = await getVisualSessionState(redisClient, req.body.sessionId)
+    if (!visualState?.activeTurnId) {
+      return sendError(
+        res,
+        409,
+        'orchestration_state_missing',
+        'Visual analysis events require active orchestration state',
+        req.requestId
+      )
+    }
+    if (req.body.turnId && visualState.activeTurnId !== req.body.turnId) {
+      return sendError(
+        res,
+        409,
+        'turn_mismatch',
+        'Visual analysis event turnId does not match orchestration state',
+        req.requestId
+      )
+    }
+  }
+
   const event = {
     messageId: req.body.messageId,
     type: req.body.type,
@@ -1042,7 +1389,9 @@ async function handleEventIngestRequest(req, res, deps = {}) {
     tsWallIso: req.body.tsWallIso || new Date().toISOString(),
     correlationId: req.body.correlationId || null,
     causationId: req.body.causationId || null,
-    schemaVersion: req.body.schemaVersion || '1.0',
+    turnId: req.body.turnId || null,
+    snapshotId: req.body.snapshotId || null,
+    schemaVersion: req.body.schemaVersion || '2.0',
     payload: req.body.payload
   }
 

@@ -23,7 +23,13 @@ function createEnvelope(overrides = {}) {
     messageId: 'evt-1',
     type: 'capture.requested',
     sessionId: 'session-1',
-    payload: { source: 'camera' },
+    correlationId: 'corr-1',
+    causationId: 'cause-1',
+    tsWallIso: '2026-04-22T12:00:00.000Z',
+    schemaVersion: '2.0',
+    turnId: 'turn-1',
+    snapshotId: 'snap-1',
+    payload: { reason: 'need a snapshot', captureMode: 'fresh_photo' },
     ...overrides
   }
 }
@@ -79,5 +85,44 @@ test('POST /api/events returns duplicate when atomic enqueue reports an existing
     assert.equal(response.status, 200)
     assert.equal(body.status, 'duplicate')
     assert.equal(body.messageId, 'evt-duplicate')
+  })
+})
+
+test('POST /api/events rejects visual analysis completion without orchestration state', async () => {
+  app.locals.eventIngestDeps = {
+    redisReady: true,
+    redisClient: {
+      async get() {
+        return null
+      },
+      async sendCommand() {
+        throw new Error('enqueue should not run')
+      }
+    }
+  }
+
+  await withServer(async (baseUrl) => {
+    const response = await fetch(`${baseUrl}/api/events`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        messageId: 'evt-visual-1',
+        type: 'analysis.completed',
+        sessionId: 'session-1',
+        correlationId: 'corr-1',
+        causationId: 'cause-1',
+        tsWallIso: '2026-04-22T12:00:00.000Z',
+        schemaVersion: '2.0',
+        turnId: 'turn-1',
+        snapshotId: 'snap-1',
+        payload: {
+          status: 'completed'
+        }
+      })
+    })
+    const body = await response.json()
+
+    assert.equal(response.status, 409)
+    assert.equal(body.code, 'orchestration_state_missing')
   })
 })

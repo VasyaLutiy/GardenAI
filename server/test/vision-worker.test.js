@@ -30,6 +30,64 @@ function createClient() {
   }
 }
 
+test('processVisionCommand publishes analysis.completed into session stream with visual ids', async () => {
+  const client = createClient()
+  const originalFetch = global.fetch
+  global.fetch = async () => ({
+    ok: true,
+    async json() {
+      return {
+        choices: [
+          {
+            message: {
+              content: JSON.stringify({
+                species: 'Rose',
+                confidence: 0.91,
+                diagnoses: ['healthy'],
+                suggestions: ['continue current watering'],
+                urgency: 'low',
+                disclaimer: 'AI guidance only'
+              })
+            }
+          }
+        ]
+      }
+    }
+  })
+
+  try {
+    await processVisionCommand(client, {
+      messageId: 'msg-success',
+      sessionId: 'session-success',
+      correlationId: 'corr-success',
+      turnId: 'turn-success',
+      snapshotId: 'snap-success',
+      schemaVersion: '2.0',
+      payload: {
+        imageArtifactKey: 'artifact:image:msg-success',
+        replyKey: 'analysis:reply:msg-success',
+        toolCallId: 'call-success',
+        analysisGoal: 'diagnose',
+        attempt: 1
+      }
+    })
+  } finally {
+    global.fetch = originalFetch
+  }
+
+  const analysisResultAdd = client.calls.find((call) => call[0] === 'xAdd' && call[1] === 'stream:analysis-results')
+  const sessionEventAdd = client.calls.find((call) => call[0] === 'xAdd' && call[1] === 'stream:session-events')
+  assert.ok(analysisResultAdd)
+  assert.ok(sessionEventAdd)
+
+  const publishedEvent = JSON.parse(sessionEventAdd[3].payload)
+  assert.equal(publishedEvent.type, 'analysis.completed')
+  assert.equal(publishedEvent.turnId, 'turn-success')
+  assert.equal(publishedEvent.snapshotId, 'snap-success')
+  assert.equal(publishedEvent.toolCallId, 'call-success')
+  assert.equal(publishedEvent.payload.species, 'Rose')
+})
+
 test('processVisionCommand requeues on transient failure without deleting the artifact', async () => {
   const client = createClient()
   const originalFetch = global.fetch
@@ -45,6 +103,10 @@ test('processVisionCommand requeues on transient failure without deleting the ar
       payload: {
         imageArtifactKey: 'artifact:image:msg-1',
         replyKey: 'analysis:reply:msg-1',
+        toolCallId: 'call-1',
+        analysisGoal: 'diagnose',
+        turnId: 'turn-1',
+        snapshotId: 'snap-1',
         attempt: 1
       }
     })
@@ -63,6 +125,7 @@ test('processVisionCommand requeues on transient failure without deleting the ar
   assert.equal(retriedEvent.messageId, 'msg-1')
   assert.equal(retriedEvent.payload.imageArtifactKey, 'artifact:image:msg-1')
   assert.equal(retriedEvent.payload.replyKey, 'analysis:reply:msg-1')
+  assert.equal(retriedEvent.payload.toolCallId, 'call-1')
   assert.equal(retriedEvent.payload.attempt, 2)
   assert.equal(client.calls.some((call) => call[0] === 'del'), false)
 })
@@ -82,6 +145,10 @@ test('processVisionCommand deletes the artifact after terminal failure', async (
       payload: {
         imageArtifactKey: 'artifact:image:msg-2',
         replyKey: 'analysis:reply:msg-2',
+        toolCallId: 'call-2',
+        analysisGoal: 'diagnose',
+        turnId: 'turn-2',
+        snapshotId: 'snap-2',
         attempt: 3
       }
     })
