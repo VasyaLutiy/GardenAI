@@ -1,0 +1,39 @@
+{
+  "expo": {
+    "name": "GardenAI",
+    "slug": "gardenai-mobile",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.gardenai.mobile",
+      "infoPlist": {
+        "NSCameraUsageDescription": "Нужна камера для анализа растений",
+        "NSMicrophoneUsageDescription": "Нужен микрофон для голосового помощника"
+      }
+    },
+    "android": {
+      "package": "com.gardenai.mobile",
+      "permissions": [
+        "android.permission.CAMERA",
+        "android.permission.RECORD_AUDIO",
+        "android.permission.INTERNET"
+      ]
+    },
+    "plugins": [
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Нужна камера для анализа растений",
+          "microphonePermission": "Нужен микрофон для голосового помощника"
+        }
+      ],
+      "expo-asset"
+    ],
+    "extra": {
+      "apiBaseUrl": "https://gardenai-server-h2gggucrwq-uc.a.run.app",
+      "realtimeTokenAuthSecret": ""
+    }
+  }
+}
