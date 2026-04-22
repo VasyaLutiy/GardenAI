@@ -24,7 +24,7 @@ import {
   SNAPSHOT_BUFFER_LIMIT,
   TOOL_RESULT_TTL_MS,
 } from '../config'
-import { dlog } from '../lib/debugLog'
+import { dlog, flushDebugLog, LOG_PATH, logOrchestration, resetDebugLog, startDebugSession } from '../lib/debugLog'
 
 type AppEvent = Record<string, unknown>
 type FramingHint = 'whole_plant' | 'leaf_closeup' | 'stem_closeup' | 'soil' | 'problem_area'
@@ -125,16 +125,29 @@ export default function MainScreen() {
   const registerPendingCall = useCallback((call: PendingToolCall) => {
     prunePendingCalls()
     pendingCallsRef.current.set(call.callId, call)
+    logOrchestration('pending.register', {
+      ...call,
+      size: pendingCallsRef.current.size,
+    })
   }, [prunePendingCalls])
 
   const updatePendingCall = useCallback((callId: string, patch: Partial<PendingToolCall>) => {
     const existing = pendingCallsRef.current.get(callId)
     if (!existing) return
     pendingCallsRef.current.set(callId, { ...existing, ...patch })
+    logOrchestration('pending.update', {
+      callId,
+      patch,
+      size: pendingCallsRef.current.size,
+    })
   }, [])
 
   const clearPendingCall = useCallback((callId: string) => {
     pendingCallsRef.current.delete(callId)
+    logOrchestration('pending.clear', {
+      callId,
+      size: pendingCallsRef.current.size,
+    })
   }, [])
 
   const hasPendingCall = useCallback((callId?: string | null) => {
@@ -154,6 +167,12 @@ export default function MainScreen() {
       if (snapshotId && call.snapshotId === snapshotId) return call
       if (turnId && call.turnId === turnId) return call
     }
+    logOrchestration('pending.analyze.miss', {
+      toolCallId: toolCallId ?? null,
+      snapshotId: snapshotId ?? null,
+      turnId: turnId ?? null,
+      size: pendingCallsRef.current.size,
+    })
     return null
   }, [prunePendingCalls])
 
@@ -190,7 +209,7 @@ export default function MainScreen() {
       turnId?: string
     },
   ) => {
-    await postEvent(buildEnvelope(
+    const envelope = buildEnvelope(
       type,
       sessionId,
       payload,
@@ -198,7 +217,17 @@ export default function MainScreen() {
       ids.causationId,
       ids.snapshotId,
       ids.turnId,
-    ))
+    )
+    logOrchestration('event.post', {
+      type,
+      messageId: envelope.messageId,
+      correlationId: ids.correlationId,
+      causationId: ids.causationId,
+      snapshotId: ids.snapshotId ?? null,
+      turnId: ids.turnId ?? null,
+      payload,
+    })
+    await postEvent(envelope)
   }, [sessionId])
 
   const realtime = useRealtime({
@@ -224,11 +253,13 @@ export default function MainScreen() {
   })
 
   const completeToolCall = useCallback((callId: string, payload: Record<string, unknown>) => {
+    logOrchestration('tool.complete', { callId, payload })
     realtime.sendFunctionResult(callId, payload)
     clearPendingCall(callId)
   }, [clearPendingCall, realtime])
 
   const rejectToolCall = useCallback((callId: string, reasonCode: string, extras: Record<string, unknown> = {}) => {
+    logOrchestration('tool.reject', { callId, reasonCode, extras })
     completeToolCall(callId, {
       schemaVersion: '2.0',
       status: 'rejected',
@@ -256,6 +287,18 @@ export default function MainScreen() {
     reason: string
     source: string
   }) => {
+    logOrchestration('capture.begin', {
+      turnId,
+      snapshotId,
+      correlationId,
+      causationId,
+      captureMode,
+      framingHint: framingHint ?? null,
+      reason,
+      source,
+      cameraReady,
+      currentlyCapturing: isCapturingRef.current,
+    })
     if (!cameraReady) {
       setVisualState((prev) => ({
         ...prev,
@@ -300,6 +343,13 @@ export default function MainScreen() {
 
     try {
       const buffered = getFreshBufferedSnapshot(captureMode, framingHint)
+      logOrchestration('capture.source', {
+        turnId,
+        snapshotId,
+        correlationId,
+        source: buffered ? 'buffer' : 'camera',
+        bufferedSnapshotId: buffered?.snapshotId ?? null,
+      })
       const uri = buffered?.uri || await takePhoto()
       if (!uri) {
         setVisualState((prev) => ({ ...prev, captureState: 'failed' }))
@@ -319,6 +369,14 @@ export default function MainScreen() {
         framingHint,
       }
       rememberSnapshot(snapshot)
+      logOrchestration('snapshot.remembered', {
+        snapshotId,
+        turnId,
+        correlationId,
+        captureTs: snapshot.captureTs,
+        framingHint: framingHint ?? null,
+        uri,
+      })
       setStatus(buffered ? 'using buffered snapshot' : 'snapshot captured')
       setVisualState((prev) => ({
         ...prev,
@@ -349,6 +407,12 @@ export default function MainScreen() {
     } finally {
       isCapturingRef.current = false
       setIsAnalyzing(false)
+      logOrchestration('capture.end', {
+        turnId,
+        snapshotId,
+        correlationId,
+        captureState: visualStateRef.current.captureState,
+      })
     }
   }, [cameraReady, getFreshBufferedSnapshot, postVisualEvent, rememberSnapshot, takePhoto])
 
@@ -363,6 +427,14 @@ export default function MainScreen() {
     analysisGoal: AnalysisGoal
     summaryMode?: boolean
   }) => {
+    logOrchestration('analysis.begin', {
+      snapshotId: snapshot.snapshotId,
+      turnId: snapshot.turnId,
+      correlationId: snapshot.correlationId,
+      callId: callId ?? null,
+      analysisGoal,
+      summaryMode: Boolean(summaryMode),
+    })
     setIsAnalyzing(true)
     setStatus(`analyzing ${analysisGoal}`)
     setVisualState((prev) => ({
@@ -412,6 +484,16 @@ export default function MainScreen() {
         },
       )
       setAnalysis(result)
+      logOrchestration('analysis.success', {
+        snapshotId: snapshot.snapshotId,
+        turnId: snapshot.turnId,
+        correlationId: snapshot.correlationId,
+        callId: callId ?? null,
+        analysisGoal,
+        species: result.species,
+        confidence: result.confidence,
+        urgency: result.urgency,
+      })
       setStatus('analysis received')
       setVisualState((prev) => ({
         ...prev,
@@ -439,6 +521,14 @@ export default function MainScreen() {
       return result
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err)
+      logOrchestration('analysis.failure', {
+        snapshotId: snapshot.snapshotId,
+        turnId: snapshot.turnId,
+        correlationId: snapshot.correlationId,
+        callId: callId ?? null,
+        analysisGoal,
+        error: message,
+      })
       setStatus(`analysis error: ${message}`)
       setVisualState((prev) => ({
         ...prev,
@@ -620,12 +710,110 @@ export default function MainScreen() {
     })
   }, [completeToolCall, getSnapshotById, registerPendingCall, rejectToolCall, runCapture])
 
+  const handleLegacyVisualTool = useCallback(async (
+    name: string,
+    callId: string,
+    _args: Record<string, unknown>,
+  ) => {
+    const analysisGoal =
+      name === 'identify_plant'
+        ? 'identify'
+        : name === 'diagnose_plant'
+          ? 'diagnose'
+          : name === 'care_advice'
+            ? 'care_advice'
+            : null
+
+    if (!analysisGoal) {
+      rejectToolCall(callId, 'unsupported_tool', { name })
+      return
+    }
+
+    const currentSnapshot = getSnapshotById(visualStateRef.current.activeSnapshotId)
+    logOrchestration('tool.legacy.redirect', {
+      name,
+      callId,
+      analysisGoal,
+      reusedSnapshotId: currentSnapshot?.snapshotId ?? null,
+    })
+
+    if (currentSnapshot) {
+      registerPendingCall({
+        callId,
+        name: 'analyze_plant_snapshot',
+        turnId: currentSnapshot.turnId,
+        snapshotId: currentSnapshot.snapshotId,
+        correlationId: currentSnapshot.correlationId,
+        analysisGoal,
+        createdAt: Date.now(),
+      })
+      await runAnalysis({
+        snapshot: currentSnapshot,
+        callId,
+        analysisGoal,
+      })
+      return
+    }
+
+    const turnId = createId('turn')
+    const snapshotId = createId('snap')
+    const correlationId = createId('corr')
+    registerPendingCall({
+      callId,
+      name: 'analyze_plant_snapshot',
+      turnId,
+      snapshotId,
+      correlationId,
+      analysisGoal,
+      createdAt: Date.now(),
+    })
+
+    const result = await runCapture({
+      turnId,
+      snapshotId,
+      correlationId,
+      causationId: callId,
+      captureMode: 'fresh_photo',
+      framingHint: analysisGoal === 'diagnose' ? 'problem_area' : 'whole_plant',
+      reason: `legacy_tool:${name}`,
+      source: `tool:${name}`,
+    })
+
+    if (result.status !== 'accepted') {
+      rejectToolCall(callId, result.reasonCode, {
+        correlationId,
+        snapshotId,
+        turnId,
+        legacyName: name,
+      })
+      return
+    }
+
+    const snapshot = getSnapshotById(snapshotId)
+    if (!snapshot) {
+      rejectToolCall(callId, 'snapshot_missing', {
+        correlationId,
+        snapshotId,
+        turnId,
+        legacyName: name,
+      })
+      return
+    }
+
+    await runAnalysis({
+      snapshot,
+      callId,
+      analysisGoal,
+    })
+  }, [getSnapshotById, registerPendingCall, rejectToolCall, runAnalysis, runCapture])
+
   const handleToolCall = useCallback(async (
     name: string,
     callId: string,
     args: Record<string, unknown>,
   ) => {
     addEvent({ type: 'tool_call.started', payload: { name, callId, args } })
+    logOrchestration('tool.received', { name, callId, args })
 
     if (name === 'request_plant_snapshot') {
       await handleRequestPlantSnapshot(callId, args)
@@ -643,12 +831,17 @@ export default function MainScreen() {
       await handleRequestReframe(callId, args)
       return
     }
+    if (name === 'identify_plant' || name === 'diagnose_plant' || name === 'care_advice') {
+      await handleLegacyVisualTool(name, callId, args)
+      return
+    }
 
     rejectToolCall(callId, 'unsupported_tool', { name })
   }, [
     addEvent,
     handleAnalyzePlantSnapshot,
     handleGetVisualContext,
+    handleLegacyVisualTool,
     handleRequestPlantSnapshot,
     handleRequestReframe,
     rejectToolCall,
@@ -687,11 +880,19 @@ export default function MainScreen() {
     const now = Date.now()
     if (now - lastCaptureTriggerRef.current < LOCAL_CAPTURE_COOLDOWN_MS) {
       addEvent({ type: 'capture.local.skipped.cooldown', payload: { reason } })
+      logOrchestration('capture.trigger.skipped', { reason, analysisGoal, source })
       return
     }
     lastCaptureTriggerRef.current = now
     addEvent({ type: 'capture.local.triggered', payload: { reason } })
+    logOrchestration('capture.triggered', { reason, analysisGoal, source })
     runAutonomousVisualTurn(reason, analysisGoal, source).catch((err: unknown) => {
+      logOrchestration('capture.trigger.error', {
+        reason,
+        analysisGoal,
+        source,
+        error: err instanceof Error ? err.message : String(err),
+      })
       setStatus('auto visual error: ' + (err instanceof Error ? err.message : String(err)))
     })
   }, [addEvent, runAutonomousVisualTurn])
@@ -713,6 +914,14 @@ export default function MainScreen() {
       confidence: inferred.confidence,
       transcriptText: text,
       source,
+    })
+    logOrchestration('intent.detected', {
+      source,
+      intent: inferred.intent,
+      confidence: inferred.confidence,
+      correlationId: envelope.correlationId,
+      causationId: envelope.causationId,
+      messageId: envelope.messageId,
     })
     addEvent({ type: 'intent.inferred', payload: { source, intent: inferred.intent, confidence: inferred.confidence, text } })
     postEvent(envelope).catch(() => {})
@@ -738,6 +947,15 @@ export default function MainScreen() {
     const matchesActiveVisualEvent =
       (!turnId || !activeTurnId || turnId === activeTurnId) &&
       (!snapshotId || !activeSnapshotId || snapshotId === activeSnapshotId)
+    logOrchestration('ws.dispatch', {
+      type: type ?? 'unknown',
+      toolCallId,
+      snapshotId,
+      turnId,
+      activeTurnId,
+      activeSnapshotId,
+      matchesActiveVisualEvent,
+    })
 
     if (type === 'analysis.completed') {
       if (!matchesActiveVisualEvent) return
@@ -842,10 +1060,16 @@ export default function MainScreen() {
   const ws = useWebSocket({ sessionId, onMessage: handleWsMessage })
 
   useEffect(() => {
-    dlog('APP', '=== mount, session:', sessionId, '===')
-    ws.connect()
-    realtime.start()
+    resetDebugLog()
+      .catch(() => {})
+      .finally(() => {
+        startDebugSession({ sessionId, logPath: LOG_PATH })
+        ws.connect()
+        realtime.start()
+      })
     return () => {
+      dlog('APP', '=== unmount, session:', sessionId, '===')
+      flushDebugLog().catch(() => {})
       realtime.stop()
       ws.disconnect()
     }
@@ -903,6 +1127,7 @@ export default function MainScreen() {
       <ScrollView contentContainerStyle={styles.scroll}>
         <Text style={styles.title}>GardenAI</Text>
         <Text style={styles.meta}>session: {sessionId.slice(0, 20)}…</Text>
+        <Text style={styles.meta}>log: {LOG_PATH}</Text>
 
         {/* Camera */}
         <View style={styles.cameraContainer}>

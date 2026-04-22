@@ -1,11 +1,26 @@
 import axios from 'axios'
 import { API_BASE, REALTIME_TOKEN_AUTH_HEADER, REALTIME_TOKEN_AUTH_SECRET } from '../config'
 import type { EventEnvelope } from './eventBus'
+import { dlog, logOrchestration } from './debugLog'
 
 const http = axios.create({ baseURL: API_BASE, timeout: 30000 })
 
 export async function postEvent(event: EventEnvelope): Promise<void> {
+  const startedAt = Date.now()
+  logOrchestration('http.postEvent.request', {
+    type: event.type,
+    messageId: event.messageId,
+    sessionId: event.sessionId,
+    correlationId: event.correlationId,
+    turnId: event.turnId ?? null,
+    snapshotId: event.snapshotId ?? null,
+  })
   await http.post('/api/events', event)
+  logOrchestration('http.postEvent.response', {
+    type: event.type,
+    messageId: event.messageId,
+    durationMs: Date.now() - startedAt,
+  })
 }
 
 export interface RealtimeTokenResponse {
@@ -16,10 +31,20 @@ export interface RealtimeTokenResponse {
 }
 
 export async function fetchRealtimeToken(): Promise<RealtimeTokenResponse> {
+  const startedAt = Date.now()
+  dlog('HTTP', 'GET /api/realtime-token', {
+    baseURL: API_BASE,
+    hasAuthSecret: Boolean(REALTIME_TOKEN_AUTH_SECRET),
+  })
   const { data } = await http.get<RealtimeTokenResponse>('/api/realtime-token', {
     headers: REALTIME_TOKEN_AUTH_SECRET
       ? { [REALTIME_TOKEN_AUTH_HEADER]: REALTIME_TOKEN_AUTH_SECRET }
       : undefined,
+  })
+  dlog('HTTP', 'GET /api/realtime-token OK', {
+    durationMs: Date.now() - startedAt,
+    model: data.model,
+    expiresAt: data.expiresAt ?? null,
   })
   return data
 }
@@ -52,6 +77,7 @@ export async function uploadImageForAnalysis(
   causationId: string,
   options: UploadAnalysisOptions = {},
 ): Promise<AnalysisResult> {
+  const startedAt = Date.now()
   const fd = new FormData()
   fd.append('image', { uri, type: 'image/jpeg', name: 'capture.jpg' } as unknown as Blob)
   fd.append('sessionId', sessionId)
@@ -65,8 +91,33 @@ export async function uploadImageForAnalysis(
   if (options.framingHint) fd.append('framingHint', options.framingHint)
   if (options.source) fd.append('source', options.source)
 
+  logOrchestration('http.uploadImageForAnalysis.request', {
+    sessionId,
+    correlationId,
+    causationId,
+    snapshotId: options.snapshotId ?? null,
+    turnId: options.turnId ?? null,
+    toolCallId: options.toolCallId ?? null,
+    analysisGoal: options.analysisGoal ?? null,
+    framingHint: options.framingHint ?? null,
+    source: options.source ?? null,
+    uri,
+  })
+
   const { data } = await http.post<AnalysisResult>('/api/analyze-image', fd, {
     headers: { 'Content-Type': 'multipart/form-data' },
+  })
+  logOrchestration('http.uploadImageForAnalysis.response', {
+    sessionId,
+    correlationId,
+    snapshotId: options.snapshotId ?? null,
+    turnId: options.turnId ?? null,
+    toolCallId: options.toolCallId ?? null,
+    analysisGoal: options.analysisGoal ?? null,
+    durationMs: Date.now() - startedAt,
+    species: data.species,
+    confidence: data.confidence,
+    urgency: data.urgency,
   })
   return data
 }

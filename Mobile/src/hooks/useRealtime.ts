@@ -6,10 +6,8 @@ import {
 } from 'react-native-webrtc'
 import InCallManager from 'react-native-incall-manager'
 import { fetchRealtimeToken } from '../lib/api'
-import { dlog } from '../lib/debugLog'
+import { dlog, logOrchestration } from '../lib/debugLog'
 import {
-  REALTIME_VOICE,
-  REALTIME_VAD,
   VISUAL_TOOLS,
   ALEX_SYSTEM_PROMPT,
 } from '../config'
@@ -48,6 +46,19 @@ export function useRealtime({
   const sendEnvelope = useCallback((payload: Record<string, unknown>, createResponse = true) => {
     const dc = dcRef.current
     if (!dc || dc.readyState !== 'open') return
+    const type = typeof payload.type === 'string' ? payload.type : 'unknown'
+    if (type !== 'response.cancel') {
+      dlog('DC:OUT', {
+        type,
+        createResponse,
+        callId:
+          typeof payload.item === 'object' &&
+          payload.item &&
+          typeof (payload.item as Record<string, unknown>).call_id === 'string'
+            ? (payload.item as Record<string, unknown>).call_id
+            : null,
+      })
+    }
     dc.send(JSON.stringify(payload))
     if (createResponse) {
       dc.send(JSON.stringify({
@@ -69,6 +80,10 @@ export function useRealtime({
   }, [sendEnvelope])
 
   const sendFunctionResult = useCallback((callId: string, output: unknown) => {
+    logOrchestration('realtime.function_result', {
+      callId,
+      output,
+    })
     sendEnvelope({
       type: 'conversation.item.create',
       item: {
@@ -80,6 +95,10 @@ export function useRealtime({
   }, [sendEnvelope])
 
   const sendSystemEventSummary = useCallback((text: string, metadata?: Record<string, unknown>) => {
+    logOrchestration('realtime.system_summary', {
+      text,
+      metadata: metadata ?? null,
+    })
     sendEnvelope({
       type: 'conversation.item.create',
       item: {
@@ -104,6 +123,7 @@ export function useRealtime({
   const start = useCallback(async () => {
     if (connectedRef.current || startingRef.current) return
     startingRef.current = true
+    dlog('RT', 'start', { connected: connectedRef.current })
 
     if (reconnectTimerRef.current) {
       clearTimeout(reconnectTimerRef.current)
@@ -120,8 +140,10 @@ export function useRealtime({
       setStatus('starting realtime')
 
       const { token, realtimeUrl, model } = await fetchRealtimeToken()
+      dlog('RT', 'token ready', { model, realtimeUrl })
       const stream = await mediaDevices.getUserMedia({ audio: true, video: false }) as MediaStream
       streamRef.current = stream
+      dlog('RT', 'audio stream ready', { trackCount: stream.getTracks().length })
 
       InCallManager.start({ media: 'audio' })
       InCallManager.setSpeakerphoneOn(true)
@@ -133,6 +155,7 @@ export function useRealtime({
         const state = (pc as unknown as { connectionState: string }).connectionState
 
         if (state === 'connected') {
+          dlog('RT', 'pc.connected')
           connectedRef.current = true
           startingRef.current = false
           setConnected(true)
@@ -140,12 +163,14 @@ export function useRealtime({
         }
 
         if (state === 'disconnected') {
+          dlog('RT', 'pc.disconnected')
           connectedRef.current = false
           setConnected(false)
           setStatus('realtime disconnected — waiting for recovery...')
         }
 
         if (state === 'failed') {
+          dlog('RT', 'pc.failed')
           connectedRef.current = false
           startingRef.current = false
           setConnected(false)
@@ -183,6 +208,13 @@ export function useRealtime({
         if (type !== 'response.audio.delta') {
           dlog('DC', JSON.stringify(payload).slice(0, 300))
         }
+        if (type === 'response.function_call_arguments.done') {
+          logOrchestration('realtime.tool_call', {
+            callId: payload.call_id ?? null,
+            name: payload.name ?? null,
+            arguments: payload.arguments ?? null,
+          })
+        }
 
         if (type === 'session.created') {
           dlog('RT', 'session.created — sending session.update')
@@ -191,8 +223,6 @@ export function useRealtime({
             session: {
               type: 'realtime',
               instructions: ALEX_SYSTEM_PROMPT,
-              voice: REALTIME_VOICE,
-              turn_detection: REALTIME_VAD,
               tools: VISUAL_TOOLS,
               tool_choice: 'auto',
             },
@@ -254,6 +284,7 @@ export function useRealtime({
 
       const offer = await pc.createOffer({})
       await pc.setLocalDescription(offer)
+      dlog('RT', 'local offer ready', { sdpLength: pc.localDescription?.sdp?.length ?? 0 })
 
       const sdpResp = await fetch(`${realtimeUrl}?model=${encodeURIComponent(model)}`, {
         method: 'POST',
@@ -270,11 +301,13 @@ export function useRealtime({
 
       const answerSdp = await sdpResp.text()
       await pc.setRemoteDescription({ type: 'answer', sdp: answerSdp })
+      dlog('RT', 'remote answer applied', { sdpLength: answerSdp.length })
       setStatus('realtime negotiating')
     } catch (err: unknown) {
       startingRef.current = false
       connectedRef.current = false
       const message = err instanceof Error ? err.message : String(err)
+      dlog('RT', 'start error', { message })
       setStatus(`realtime error: ${message}`)
       setConnected(false)
       pcRef.current?.close()
@@ -287,6 +320,7 @@ export function useRealtime({
   startRef.current = start
 
   const stop = useCallback(() => {
+    dlog('RT', 'stop')
     if (reconnectTimerRef.current) {
       clearTimeout(reconnectTimerRef.current)
       reconnectTimerRef.current = null

@@ -1,5 +1,6 @@
 import { useRef, useState, useCallback } from 'react'
 import { WS_BASE } from '../config'
+import { dlog, logOrchestration } from '../lib/debugLog'
 
 export type WsMessage = Record<string, unknown>
 
@@ -17,33 +18,51 @@ export function useWebSocket({ sessionId, onMessage }: UseWebSocketOptions) {
   const connect = useCallback(() => {
     if (wsRef.current?.readyState === WebSocket.OPEN) return
 
-    const ws = new WebSocket(`${WS_BASE}/ws?sessionId=${encodeURIComponent(sessionId)}`)
+    const url = `${WS_BASE}/ws?sessionId=${encodeURIComponent(sessionId)}`
+    dlog('WS', 'connect', { sessionId, url })
+    const ws = new WebSocket(url)
     wsRef.current = ws
 
-    ws.onopen = () => setConnected(true)
+    ws.onopen = () => {
+      dlog('WS', 'open', { sessionId })
+      setConnected(true)
+    }
 
     ws.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data as string) as WsMessage
+        logOrchestration('ws.message', {
+          sessionId,
+          type: typeof data.type === 'string' ? data.type : 'unknown',
+          messageId: typeof data.messageId === 'string' ? data.messageId : null,
+          correlationId: typeof data.correlationId === 'string' ? data.correlationId : null,
+          turnId: typeof data.turnId === 'string' ? data.turnId : null,
+          snapshotId: typeof data.snapshotId === 'string' ? data.snapshotId : null,
+        })
         onMessage(data)
       } catch {
-        // игнорируем невалидный JSON
+        dlog('WS', 'invalid-json', { sessionId, raw: String(event.data).slice(0, 300) })
       }
     }
 
     ws.onclose = () => {
+      dlog('WS', 'close', { sessionId })
       setConnected(false)
       wsRef.current = null
     }
 
-    ws.onerror = () => setConnected(false)
+    ws.onerror = () => {
+      dlog('WS', 'error', { sessionId })
+      setConnected(false)
+    }
   }, [sessionId, onMessage])
 
   const disconnect = useCallback(() => {
+    dlog('WS', 'disconnect', { sessionId })
     wsRef.current?.close()
     wsRef.current = null
     setConnected(false)
-  }, [])
+  }, [sessionId])
 
   return { connected, connect, disconnect }
 }
