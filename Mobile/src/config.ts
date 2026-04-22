@@ -11,14 +11,14 @@ export const REALTIME_TOKEN_AUTH_SECRET: string =
 // Физическое устройство: укажи IP машины, например http://192.168.1.x:3000
 
 export const WS_BASE: string = API_BASE.replace(/^http/i, 'ws')
-export const REALTIME_TOKEN_AUTH_HEADER = 'x-gardenai-realtime-token-secret'
-export const REALTIME_TOKEN_AUTH_SECRET: string =
-  (Constants.expoConfig?.extra?.realtimeTokenAuthSecret as string) || ''
 
 export const REALTIME_TRANSCRIBE_MODEL = 'gpt-4o-mini-transcribe'
 export const RECENT_EVENTS_LIMIT = 40
 export const LOCAL_CAPTURE_COOLDOWN_MS = 6000
 export const INTENT_DEDUP_TTL_MS = 3000
+export const SNAPSHOT_BUFFER_LIMIT = 3
+export const SNAPSHOT_BUFFER_FRESHNESS_MS = 1500
+export const TOOL_RESULT_TTL_MS = 120000
 
 // --- Realtime: персонаж, голос, VAD, инструменты ---
 
@@ -31,50 +31,111 @@ export const REALTIME_VAD = {
   silence_duration_ms: 700,
 }
 
-export const TAKE_PHOTO_TOOL = {
+export const REQUEST_PLANT_SNAPSHOT_TOOL = {
   type: 'function' as const,
-  name: 'take_photo_and_analyze',
+  name: 'request_plant_snapshot',
   description:
-    'Сделать снимок растения через камеру устройства и получить его анализ: ' +
-    'вид, состояние здоровья, возможные болезни и рекомендации по уходу. ' +
-    'Вызывай всегда когда пользователь говорит о конкретном растении, ' +
-    'описывает проблему или хочет его определить.',
+    'Запросить захват актуального кадра растения с камеры устройства.',
   parameters: {
     type: 'object' as const,
+    additionalProperties: false,
     properties: {
       reason: {
         type: 'string' as const,
-        description: 'Причина снимка: что именно хочет узнать пользователь',
+        description: 'Зачем нужен кадр',
+      },
+      capture_mode: {
+        type: 'string' as const,
+        enum: ['latest_buffered', 'fresh_photo'],
+      },
+      framing_hint: {
+        type: 'string' as const,
+        enum: ['whole_plant', 'leaf_closeup', 'stem_closeup', 'soil', 'problem_area'],
       },
     },
     required: ['reason'],
   },
 }
 
-export const ALEX_SYSTEM_PROMPT = `
-Ты Алекс — опытный садовник с 20-летним стажем. Живёшь растениями, знаешь их по именам, любишь свою работу.
+export const ANALYZE_PLANT_SNAPSHOT_TOOL = {
+  type: 'function' as const,
+  name: 'analyze_plant_snapshot',
+  description: 'Запустить анализ уже захваченного snapshot растения.',
+  parameters: {
+    type: 'object' as const,
+    additionalProperties: false,
+    properties: {
+      snapshotId: { type: 'string' as const },
+      analysis_goal: {
+        type: 'string' as const,
+        enum: ['identify', 'diagnose', 'care_advice'],
+      },
+    },
+    required: ['snapshotId', 'analysis_goal'],
+  },
+}
 
-Как ты общаешься:
-- Тепло, по делу, иногда с лёгким юмором
-- Кратко: 1-3 предложения, не монологи
-- Говоришь как живой человек, не как справочник
-- Можешь сказать "ой, интересно" или "подожди, дай посмотрю"
-- Никогда не говоришь "как языковая модель" или "я ИИ"
+export const GET_VISUAL_CONTEXT_TOOL = {
+  type: 'function' as const,
+  name: 'get_visual_context',
+  description: 'Получить текущее состояние visual session.',
+  parameters: {
+    type: 'object' as const,
+    additionalProperties: false,
+    properties: {},
+  },
+}
+
+export const REQUEST_REFRAME_TOOL = {
+  type: 'function' as const,
+  name: 'request_reframe',
+  description: 'Запросить новый кадр с другим ракурсом.',
+  parameters: {
+    type: 'object' as const,
+    additionalProperties: false,
+    properties: {
+      snapshotId: { type: 'string' as const },
+      framing_hint: {
+        type: 'string' as const,
+        enum: ['whole_plant', 'leaf_closeup', 'stem_closeup', 'soil', 'problem_area'],
+      },
+      reason: { type: 'string' as const },
+    },
+    required: ['framing_hint', 'reason'],
+  },
+}
+
+export const VISUAL_TOOLS = [
+  REQUEST_PLANT_SNAPSHOT_TOOL,
+  ANALYZE_PLANT_SNAPSHOT_TOOL,
+  GET_VISUAL_CONTEXT_TOOL,
+  REQUEST_REFRAME_TOOL,
+] as const
+
+export const ALEX_SYSTEM_PROMPT = `
+Ты Алекс — опытный садовник с практическим взглядом. Отвечай тепло, кратко и по делу, обычно 1-3 предложениями.
+
+Правила visual tools:
+- Если нужно посмотреть на конкретное растение, сначала вызывай request_plant_snapshot.
+- После успешного snapshot используй analyze_plant_snapshot со snapshotId.
+- Если кадр неудачный или ракурс слабый, вызывай request_reframe.
+- Перед повторным захватом или анализом можешь вызвать get_visual_context.
+- Никогда не придумывай snapshotId, turnId или результат анализа.
+- Не говори, что анализ завершен, пока tool output не вернет status=completed.
+- Если tool вернул rejected или failed, коротко объясни пользователю что сделать дальше.
 
 Когда смотреть на растение:
-- Пользователь описывает проблему ("листья желтеют", "что-то не то")
-- Хочет определить растение
-- Просит совет по уходу за конкретным растением
-- В этих случаях СРАЗУ вызывай take_photo_and_analyze — не спрашивай разрешения
+- Пользователь хочет определить растение.
+- Пользователь описывает проблему конкретного растения.
+- Пользователь просит совет по уходу за растением, которое видно в камере.
 
-Когда НЕ нужно смотреть:
-- Общие вопросы ("как поливать кактусы?")
-- Разговор не о конкретном растении перед камерой
+Когда не нужен visual tool:
+- Общие вопросы без конкретного растения перед камерой.
+- Разговоры о садоводстве без необходимости смотреть изображение.
 
 После анализа:
-- Говори от первого лица: "Вижу...", "Похоже на...", "Мне кажется..."
-- Дай конкретный совет, не список из 10 пунктов
-- Если неуверен — честно скажи
+- Говори от первого лица: "Вижу...", "Похоже на...", "Я бы сделал так..."
+- Если уверенность низкая, честно скажи это и предложи новый ракурс.
 
-Язык: отвечай на том языке на котором к тебе обращаются.
+Язык ответа: тот же, что использует пользователь.
 `.trim()

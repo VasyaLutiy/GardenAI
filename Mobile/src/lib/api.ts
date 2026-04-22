@@ -33,6 +33,13 @@ export interface AnalysisResult {
   disclaimer: string
 }
 
+export interface UploadAnalysisOptions {
+  snapshotId?: string
+  turnId?: string
+  toolCallId?: string
+  analysisGoal?: 'identify' | 'diagnose' | 'care_advice'
+}
+
 // FormData с URI — надёжный способ для Android и iOS.
 // Не используем Blob/toDataURL (нет Canvas в RN).
 export async function uploadImageForAnalysis(
@@ -40,12 +47,17 @@ export async function uploadImageForAnalysis(
   sessionId: string,
   correlationId: string,
   causationId: string,
+  options: UploadAnalysisOptions = {},
 ): Promise<AnalysisResult> {
   const fd = new FormData()
   fd.append('image', { uri, type: 'image/jpeg', name: 'capture.jpg' } as unknown as Blob)
   fd.append('sessionId', sessionId)
   fd.append('correlationId', correlationId)
   fd.append('causationId', causationId)
+  if (options.snapshotId) fd.append('snapshotId', options.snapshotId)
+  if (options.turnId) fd.append('turnId', options.turnId)
+  if (options.toolCallId) fd.append('toolCallId', options.toolCallId)
+  if (options.analysisGoal) fd.append('analysisGoal', options.analysisGoal)
 
   const { data } = await http.post<AnalysisResult>('/api/analyze-image', fd, {
     headers: { 'Content-Type': 'multipart/form-data' },

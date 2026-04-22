@@ -8,10 +8,9 @@ import InCallManager from 'react-native-incall-manager'
 import { fetchRealtimeToken } from '../lib/api'
 import { dlog } from '../lib/debugLog'
 import {
-  REALTIME_TRANSCRIBE_MODEL,
   REALTIME_VOICE,
   REALTIME_VAD,
-  TAKE_PHOTO_TOOL,
+  VISUAL_TOOLS,
   ALEX_SYSTEM_PROMPT,
 } from '../config'
 
@@ -21,6 +20,10 @@ interface UseRealtimeOptions {
   onUserTranscript: (text: string) => void
   onToolCall: (name: string, callId: string, args: Record<string, unknown>) => void
   onEvent: (event: Record<string, unknown>) => void
+}
+
+function serializeOutput(output: unknown): string {
+  return typeof output === 'string' ? output : JSON.stringify(output)
 }
 
 export function useRealtime({
@@ -34,87 +37,64 @@ export function useRealtime({
   const dcRef = useRef<ReturnType<InstanceType<typeof RTCPeerConnection>['createDataChannel']> | null>(null)
   const streamRef = useRef<MediaStream | null>(null)
   const transcriptBufferRef = useRef<Record<string, string>>({})
-
-  // Используем ref для проверки состояния внутри коллбэков,
-  // чтобы избежать stale closure при auto-reconnect
   const connectedRef = useRef(false)
   const startingRef = useRef(false)
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-
-  // startRef хранит актуальную версию start для вызова из таймера reconnect
   const startRef = useRef<() => Promise<void>>()
 
   const [connected, setConnected] = useState(false)
   const [status, setStatus] = useState('')
 
-  // --- Отправить текст как сообщение пользователя (fallback, не для tool results) ---
+  const sendEnvelope = useCallback((payload: Record<string, unknown>, createResponse = true) => {
+    const dc = dcRef.current
+    if (!dc || dc.readyState !== 'open') return
+    dc.send(JSON.stringify(payload))
+    if (createResponse) {
+      dc.send(JSON.stringify({
+        type: 'response.create',
+        response: {},
+      }))
+    }
+  }, [])
+
   const sendText = useCallback((text: string) => {
-    const dc = dcRef.current
-    if (!dc || dc.readyState !== 'open') return
-    dc.send(JSON.stringify({
+    sendEnvelope({
       type: 'conversation.item.create',
-      item: { type: 'message', role: 'user', content: [{ type: 'input_text', text }] },
-    }))
-    dc.send(JSON.stringify({
-      type: 'response.create',
-      response: {},
-    }))
-  }, [])
+      item: {
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text }],
+      },
+    })
+  }, [sendEnvelope])
 
-  // --- Вернуть результат tool call в AI ---
-  // AI получает результат как function_call_output, а не как слова пользователя.
-  // После этого он сам формулирует ответ своими словами.
-  const sendFunctionResult = useCallback((callId: string, output: string) => {
-    const dc = dcRef.current
-    if (!dc || dc.readyState !== 'open') return
-    dc.send(JSON.stringify({
+  const sendFunctionResult = useCallback((callId: string, output: unknown) => {
+    sendEnvelope({
       type: 'conversation.item.create',
       item: {
         type: 'function_call_output',
         call_id: callId,
-        output,
+        output: serializeOutput(output),
       },
-    }))
-    dc.send(JSON.stringify({
-      type: 'response.create',
-      response: {},
-    }))
-  }, [])
+    })
+  }, [sendEnvelope])
 
-  // --- Доставить результат анализа без предшествующего tool call ---
-  // Используется для путей где AI сам не инициировал захват (ручная кнопка,
-  // keyword fallback). Создаём синтетический function_call + function_call_output
-  // чтобы AI получил данные как результат инструмента, а не как слова пользователя.
-  const sendAnalysisResult = useCallback((result: unknown) => {
-    const dc = dcRef.current
-    if (!dc || dc.readyState !== 'open') return
-
-    const callId = `synth_${Date.now()}`
-
-    dc.send(JSON.stringify({
+  const sendSystemEventSummary = useCallback((text: string, metadata?: Record<string, unknown>) => {
+    sendEnvelope({
       type: 'conversation.item.create',
       item: {
-        type: 'function_call',
-        call_id: callId,
-        name: 'take_photo_and_analyze',
-        arguments: JSON.stringify({ reason: 'автоматический анализ' }),
+        type: 'message',
+        role: 'system',
+        content: [
+          {
+            type: 'input_text',
+            text: metadata ? `${text}\n${JSON.stringify(metadata)}` : text,
+          },
+        ],
       },
-    }))
-    dc.send(JSON.stringify({
-      type: 'conversation.item.create',
-      item: {
-        type: 'function_call_output',
-        call_id: callId,
-        output: JSON.stringify(result),
-      },
-    }))
-    dc.send(JSON.stringify({
-      type: 'response.create',
-      response: {},
-    }))
-  }, [])
+    })
+  }, [sendEnvelope])
 
-  // --- Прервать текущий ответ AI (если пользователь перебил) ---
   const cancelResponse = useCallback(() => {
     const dc = dcRef.current
     if (!dc || dc.readyState !== 'open') return
@@ -130,7 +110,6 @@ export function useRealtime({
       reconnectTimerRef.current = null
     }
 
-    // Страховка: если старый PC остался (не был закрыт в failed handler), убиваем его
     if (pcRef.current) {
       pcRef.current.close()
       pcRef.current = null
@@ -141,7 +120,6 @@ export function useRealtime({
       setStatus('starting realtime')
 
       const { token, realtimeUrl, model } = await fetchRealtimeToken()
-
       const stream = await mediaDevices.getUserMedia({ audio: true, video: false }) as MediaStream
       streamRef.current = stream
 
@@ -151,7 +129,7 @@ export function useRealtime({
       const pc = new RTCPeerConnection()
       pcRef.current = pc
 
-      pc.onconnectionstatechange = () => {
+      ;(pc as unknown as { onconnectionstatechange: (() => void) | null }).onconnectionstatechange = () => {
         const state = (pc as unknown as { connectionState: string }).connectionState
 
         if (state === 'connected') {
@@ -161,23 +139,19 @@ export function useRealtime({
           setStatus('realtime connected')
         }
 
-        // disconnected — временный провал (WiFi моргнул), ICE может восстановиться.
-        // Просто показываем статус, не трогаем reconnect.
         if (state === 'disconnected') {
           connectedRef.current = false
           setConnected(false)
           setStatus('realtime disconnected — waiting for recovery...')
         }
 
-        // failed — ICE не восстановился, нужен полный reconnect.
-        // Закрываем старый PC перед стартом нового.
         if (state === 'failed') {
           connectedRef.current = false
           startingRef.current = false
           setConnected(false)
           setStatus('realtime failed — reconnecting in 3s')
           pc.close()
-          streamRef.current?.getTracks().forEach((t) => t.stop())
+          streamRef.current?.getTracks().forEach((track) => track.stop())
           streamRef.current = null
           pcRef.current = null
           dcRef.current = null
@@ -193,15 +167,11 @@ export function useRealtime({
       const dc = pc.createDataChannel('garden-events')
       dcRef.current = dc
 
-      // session.update отправляется только после session.created от Azure.
-      // dc.onopen срабатывает когда data channel открыт, но Azure-сессия
-      // на бэкенде ещё не инициализирована — session.update в этот момент
-      // молча игнорируется. session.created — сигнал что сессия готова.
-      dc.onopen = () => {
+      ;(dc as unknown as { onopen: (() => void) | null }).onopen = () => {
         dlog('RT', 'dc.onopen — waiting for session.created')
       }
 
-      dc.onmessage = (event) => {
+      ;(dc as unknown as { onmessage: ((event: { data: string }) => void) | null }).onmessage = (event: { data: string }) => {
         let payload: Record<string, unknown>
         try {
           payload = JSON.parse(event.data as string)
@@ -210,13 +180,10 @@ export function useRealtime({
         }
 
         const type = payload.type as string | undefined
-
-        // Логируем все события кроме audio delta (слишком шумно)
         if (type !== 'response.audio.delta') {
           dlog('DC', JSON.stringify(payload).slice(0, 300))
         }
 
-        // --- Ждём session.created, затем конфигурируем сессию ---
         if (type === 'session.created') {
           dlog('RT', 'session.created — sending session.update')
           dc.send(JSON.stringify({
@@ -224,22 +191,29 @@ export function useRealtime({
             session: {
               type: 'realtime',
               instructions: ALEX_SYSTEM_PROMPT,
-              tools: [TAKE_PHOTO_TOOL],
+              voice: REALTIME_VOICE,
+              turn_detection: REALTIME_VAD,
+              tools: VISUAL_TOOLS,
               tool_choice: 'auto',
             },
           }))
         }
 
         if (type === 'session.updated') {
-          const sess = payload.session as Record<string, unknown> | undefined
-          const toolCount = (sess?.tools as unknown[] | undefined)?.length ?? 0
-          dlog('RT', 'session.updated tools:', toolCount, 'instructions len:', (sess?.instructions as string)?.length ?? 0)
+          const session = payload.session as Record<string, unknown> | undefined
+          const toolCount = (session?.tools as unknown[] | undefined)?.length ?? 0
+          dlog(
+            'RT',
+            'session.updated tools:',
+            toolCount,
+            'instructions len:',
+            (session?.instructions as string)?.length ?? 0,
+          )
         }
         if (type === 'error') {
           dlog('RT', 'ERROR from Azure:', JSON.stringify(payload))
         }
 
-        // --- Транскрипт ответа AI (накопительно) ---
         if (type === 'response.output_audio_transcript.delta') {
           const responseId = (payload.response_id as string) || 'unknown'
           const delta = (payload.delta as string) || ''
@@ -254,22 +228,23 @@ export function useRealtime({
           if (text) onTranscriptDone(responseId, text)
         }
 
-        // --- Транскрипт пользователя ---
         if (type === 'conversation.item.input_audio_transcription.completed') {
           const text = (payload.transcript as string) || ''
           if (text) onUserTranscript(text)
         }
 
-        // --- Tool call: AI решил сделать фото ---
         if (type === 'response.function_call_arguments.done') {
           const callId = (payload.call_id as string) || ''
           const name = (payload.name as string) || ''
           let args: Record<string, unknown> = {}
-          try { args = JSON.parse((payload.arguments as string) || '{}') } catch {}
+          try {
+            args = JSON.parse((payload.arguments as string) || '{}')
+          } catch {
+            args = {}
+          }
           if (callId && name) onToolCall(name, callId, args)
         }
 
-        // Отфильтровать шумные события
         const noisy =
           type === 'response.output_audio_transcript.delta' ||
           type === 'response.content_part.added' ||
@@ -286,7 +261,7 @@ export function useRealtime({
           Authorization: `Bearer ${token}`,
           'Content-Type': 'application/sdp',
         },
-        body: (pc.localDescription as RTCSessionDescription).sdp,
+        body: pc.localDescription?.sdp || '',
       })
 
       if (!sdpResp.ok) {
@@ -294,7 +269,7 @@ export function useRealtime({
       }
 
       const answerSdp = await sdpResp.text()
-      await pc.setRemoteDescription({ type: 'answer', sdp: answerSdp } as RTCSessionDescriptionInit)
+      await pc.setRemoteDescription({ type: 'answer', sdp: answerSdp })
       setStatus('realtime negotiating')
     } catch (err: unknown) {
       startingRef.current = false
@@ -305,12 +280,10 @@ export function useRealtime({
       pcRef.current?.close()
       pcRef.current = null
       InCallManager.stop()
-      // При ошибке (нет сети, токен истёк и т.д.) — retry через 5s
       reconnectTimerRef.current = setTimeout(() => startRef.current?.(), 5000)
     }
   }, [onTranscriptDelta, onTranscriptDone, onUserTranscript, onToolCall, onEvent])
 
-  // Держим ref актуальным — таймер reconnect всегда зовёт последнюю версию
   startRef.current = start
 
   const stop = useCallback(() => {
@@ -323,12 +296,21 @@ export function useRealtime({
     dcRef.current = null
     pcRef.current?.close()
     pcRef.current = null
-    streamRef.current?.getTracks().forEach((t) => t.stop())
+    streamRef.current?.getTracks().forEach((track) => track.stop())
     streamRef.current = null
     InCallManager.stop()
     setConnected(false)
     setStatus('realtime stopped')
   }, [])
 
-  return { connected, status, start, stop, sendText, sendFunctionResult, sendAnalysisResult, cancelResponse }
+  return {
+    connected,
+    status,
+    start,
+    stop,
+    sendText,
+    sendFunctionResult,
+    sendSystemEventSummary,
+    cancelResponse,
+  }
 }

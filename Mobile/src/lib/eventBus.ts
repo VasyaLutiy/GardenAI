@@ -15,6 +15,8 @@ export interface EventEnvelope {
   tsWallIso: string
   schemaVersion: string
   payload: Record<string, unknown>
+  snapshotId?: string
+  turnId?: string
 }
 
 export function buildEnvelope(
@@ -23,6 +25,8 @@ export function buildEnvelope(
   payload: Record<string, unknown>,
   correlationId?: string,
   causationId?: string,
+  snapshotId?: string,
+  turnId?: string,
 ): EventEnvelope {
   return {
     messageId: createId('evt'),
@@ -33,5 +37,7 @@ export function buildEnvelope(
     tsWallIso: new Date().toISOString(),
     schemaVersion: '1.0',
     payload,
+    snapshotId,
+    turnId,
   }
 }
