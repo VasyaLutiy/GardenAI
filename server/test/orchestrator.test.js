@@ -1,7 +1,7 @@
 const test = require('node:test')
 const assert = require('node:assert/strict')
 
-const { processOrchestratorMessage } = require('../index')
+const { processOrchestratorMessage, getVisualTransitionError } = require('../index')
 
 function createClient(initialState = null) {
   const calls = []
@@ -163,6 +163,61 @@ test('processOrchestratorMessage sets tool reply context with correlation for an
   assert.equal(stored.snapshotId, 'snap-ctx')
   assert.equal(stored.turnId, 'turn-ctx')
   assert.equal(stored.status, 'pending')
+})
+
+test('processOrchestratorMessage marks late analysis.completed as completed_late and preserves active visual pointers', async () => {
+  const client = createClient({
+    sessionId: 'session-1',
+    activeTurnId: 'turn-new',
+    activeSnapshotId: 'snap-new',
+    activeCorrelationId: 'corr-new',
+    snapshotState: 'analyzing',
+    analysisState: 'requested',
+    analysisRequestedCorrelationId: 'corr-new',
+    analysisRequestedTurnId: 'turn-new',
+    analysisRequestedSnapshotId: 'snap-new'
+  })
+  client.state.set('reply:tool:call-late', JSON.stringify({
+    toolCallId: 'call-late',
+    sessionId: 'session-1',
+    correlationId: 'corr-old',
+    turnId: 'turn-old',
+    snapshotId: 'snap-old',
+    status: 'timeout'
+  }))
+
+  await processOrchestratorMessage(client, {
+    id: '1710000000002-late',
+    message: {
+      payload: JSON.stringify({
+        messageId: 'evt-analysis-completed-late',
+        type: 'analysis.completed',
+        sessionId: 'session-1',
+        correlationId: 'corr-old',
+        causationId: 'cause-old',
+        turnId: 'turn-old',
+        snapshotId: 'snap-old',
+        toolCallId: 'call-late',
+        schemaVersion: '2.0',
+        payload: { species: 'rose', confidence: 0.8 }
+      })
+    }
+  })
+
+  const visualState = JSON.parse(client.state.get('state:session-visual:session-1'))
+  assert.equal(visualState.activeTurnId, 'turn-new')
+  assert.equal(visualState.activeSnapshotId, 'snap-new')
+  assert.equal(visualState.activeCorrelationId, 'corr-new')
+  assert.equal(visualState.lastCompletedTurnId, 'turn-old')
+  assert.equal(visualState.lastCompletedSnapshotId, 'snap-old')
+  assert.equal(visualState.lastCompletedCorrelationId, 'corr-old')
+  assert.equal(visualState.lastCompletedDisposition, 'late')
+
+  const replyContext = JSON.parse(client.state.get('reply:tool:call-late'))
+  assert.equal(replyContext.status, 'completed_late')
+  assert.equal(replyContext.turnId, 'turn-old')
+  assert.equal(replyContext.snapshotId, 'snap-old')
+  assert.equal(replyContext.correlationId, 'corr-old')
 })
 
 test('processOrchestratorMessage marks capture.rejected as failed for the active turn', async () => {
@@ -428,4 +483,152 @@ test('processOrchestratorMessage persists turn and snapshot state keys for snaps
   assert.equal(turnState.status, 'snapshot_ready')
   assert.equal(snapshotState.snapshotId, 'snap-state')
   assert.equal(snapshotState.status, 'uploaded')
+})
+
+test('getVisualTransitionError blocks stale analysis.completed that does not match active turn/snapshot', () => {
+  const state = {
+    sessionId: 'session-active',
+    activeTurnId: 'turn-new',
+    activeSnapshotId: 'snap-new',
+    analysisState: 'requested',
+    snapshotState: 'analyzing',
+    activeCorrelationId: 'corr-new',
+    lastCorrelationId: 'corr-new'
+  }
+
+  const staleCompletion = {
+    type: 'analysis.completed',
+    sessionId: 'session-active',
+    correlationId: 'corr-old',
+    turnId: 'turn-old',
+    snapshotId: 'snap-old'
+  }
+
+  const err = getVisualTransitionError(state, staleCompletion)
+  assert.ok(err)
+  assert.equal(err.code, 'turn_mismatch')
+  assert.equal(err.status, 409)
+})
+
+test('processOrchestratorMessage completes pending analysis after timeout without emitting duplicate completions', async () => {
+  const client = createClient()
+  client.state.set(
+    'state:session-visual:session-timeout',
+    JSON.stringify({
+      sessionId: 'session-timeout',
+      activeTurnId: 'turn-timeout',
+      activeSnapshotId: 'snap-timeout',
+      analysisState: 'requested',
+      snapshotState: 'analyzing',
+      analysisRequestedCorrelationId: 'corr-timeout',
+      analysisRequestedTurnId: 'turn-timeout',
+      analysisRequestedSnapshotId: 'snap-timeout',
+      lastToolCallId: 'tool-timeout',
+      lastCorrelationId: 'corr-timeout',
+      lastEventType: 'analysis.requested'
+    })
+  )
+
+  await processOrchestratorMessage(client, {
+    id: '1710000000010-0',
+    message: {
+      payload: JSON.stringify({
+        messageId: 'evt-late-complete',
+        type: 'analysis.completed',
+        sessionId: 'session-timeout',
+        correlationId: 'corr-timeout',
+        causationId: 'cause-timeout',
+        turnId: 'turn-timeout',
+        snapshotId: 'snap-timeout',
+        tsWallIso: '2026-04-22T12:00:10.000Z',
+        schemaVersion: '2.0',
+        toolCallId: 'tool-timeout',
+        payload: { species: 'Fern' }
+      })
+    }
+  })
+
+  const visualState = JSON.parse(client.state.get('state:session-visual:session-timeout'))
+  assert.equal(visualState.analysisState, 'completed')
+  assert.equal(visualState.snapshotState, 'completed')
+  assert.equal(visualState.lastCompletedCorrelationId, 'corr-timeout')
+  assert.equal(visualState.lastEventType, 'analysis.completed')
+
+  const turnState = JSON.parse(client.state.get('state:turn:turn-timeout'))
+  const snapshotState = JSON.parse(client.state.get('state:snapshot:snap-timeout'))
+  assert.equal(turnState.status, 'completed')
+  assert.equal(snapshotState.status, 'completed')
+
+  const replyContext = client.calls.find((call) => call[0] === 'set' && call[1] === 'reply:tool:tool-timeout')
+  assert.ok(replyContext, 'tool reply context should be set to completed after late result')
+  assert.equal(JSON.parse(replyContext[2]).status, 'completed')
+
+  const sessionAdds = client.calls.filter((call) => call[0] === 'xAdd' && call[1] === 'stream:session-events')
+  assert.equal(sessionAdds.length, 0, 'late completion should not emit duplicate session events from orchestrator')
+})
+
+test('processOrchestratorMessage upgrades failed analysis to completed when late success arrives', async () => {
+  const client = createClient()
+  client.state.set(
+    'state:session-visual:session-recover',
+    JSON.stringify({
+      sessionId: 'session-recover',
+      activeTurnId: 'turn-recover',
+      activeSnapshotId: 'snap-recover',
+      analysisState: 'failed',
+      snapshotState: 'failed',
+      lastFailedCorrelationId: 'corr-recover',
+      lastFailedTurnId: 'turn-recover',
+      lastFailedSnapshotId: 'snap-recover',
+      lastToolCallId: 'tool-recover',
+      lastEventType: 'analysis.failed'
+    })
+  )
+  client.state.set(
+    'reply:tool:tool-recover',
+    JSON.stringify({
+      toolCallId: 'tool-recover',
+      sessionId: 'session-recover',
+      correlationId: 'corr-recover',
+      turnId: 'turn-recover',
+      snapshotId: 'snap-recover',
+      status: 'failed'
+    })
+  )
+
+  await processOrchestratorMessage(client, {
+    id: '1710000000011-0',
+    message: {
+      payload: JSON.stringify({
+        messageId: 'evt-late-success',
+        type: 'analysis.completed',
+        sessionId: 'session-recover',
+        correlationId: 'corr-recover',
+        causationId: 'cause-recover',
+        turnId: 'turn-recover',
+        snapshotId: 'snap-recover',
+        schemaVersion: '2.0',
+        toolCallId: 'tool-recover',
+        payload: { species: 'Monstera' }
+      })
+    }
+  })
+
+  const visualState = JSON.parse(client.state.get('state:session-visual:session-recover'))
+  assert.equal(visualState.analysisState, 'completed')
+  assert.equal(visualState.snapshotState, 'completed')
+  assert.equal(visualState.lastCompletedCorrelationId, 'corr-recover')
+  assert.equal(visualState.lastEventType, 'analysis.completed')
+
+  const turnState = JSON.parse(client.state.get('state:turn:turn-recover'))
+  const snapshotState = JSON.parse(client.state.get('state:snapshot:snap-recover'))
+  assert.equal(turnState.status, 'completed')
+  assert.equal(snapshotState.status, 'completed')
+
+  const replyContext = client.calls.find((call) => call[0] === 'set' && call[1] === 'reply:tool:tool-recover')
+  assert.ok(replyContext, 'tool reply context should be reset to completed')
+  assert.equal(JSON.parse(replyContext[2]).status, 'completed')
+
+  const sessionAdds = client.calls.filter((call) => call[0] === 'xAdd' && call[1] === 'stream:session-events')
+  assert.equal(sessionAdds.length, 0, 'late success should not emit duplicate completion events')
 })

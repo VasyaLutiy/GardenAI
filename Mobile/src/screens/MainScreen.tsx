@@ -135,11 +135,37 @@ export default function MainScreen() {
   const visualStateRef = useRef<VisualSessionState>(visualState)
   const snapshotBufferRef = useRef<BufferedSnapshot[]>([])
   const pendingCallsRef = useRef<Map<string, PendingToolCall>>(new Map())
+  const deliveredResultsRef = useRef<Map<string, { status: AnalysisStatus; channel: string; at: number }>>(new Map())
   const lastCaptureTriggerRef = useRef(0)
   const intentDedupRef = useRef<Record<string, number>>({})
   const isCapturingRef = useRef(false)
   const handleIntentFromTranscriptRef = useRef<(text: string, source: string) => void>(() => {})
   const handleToolCallRef = useRef<(name: string, callId: string, args: Record<string, unknown>) => void>(() => {})
+
+  const makeDeliveryKey = useCallback((callId?: string | null, snapshotId?: string | null, turnId?: string | null) => {
+    if (callId) return `call:${callId}`
+    if (snapshotId) return `snap:${snapshotId}`
+    if (turnId) return `turn:${turnId}`
+    return null
+  }, [])
+
+  const recordAnalysisDelivery = useCallback((key: string | null, status: AnalysisStatus, channel: string) => {
+    if (!key) return
+    const prev = deliveredResultsRef.current.get(key)
+    deliveredResultsRef.current.set(key, { status, channel, at: Date.now() })
+    logOrchestration('analysis.delivery.record', {
+      key,
+      status,
+      channel,
+      prevStatus: prev?.status ?? null,
+      prevChannel: prev?.channel ?? null,
+    })
+  }, [])
+
+  const getAnalysisDelivery = useCallback((key: string | null) => {
+    if (!key) return null
+    return deliveredResultsRef.current.get(key) || null
+  }, [])
 
   useEffect(() => {
     visualStateRef.current = visualState
@@ -557,10 +583,18 @@ export default function MainScreen() {
         analysis: result,
       }
 
-      if (callId && hasPendingCall(callId)) {
-        completeToolCall(callId, payload)
-      } else if (summaryMode) {
-        realtime.sendSystemEventSummary('Visual analysis completed.', payload)
+      const deliveryKey = makeDeliveryKey(callId, snapshot.snapshotId, snapshot.turnId)
+      const alreadyDelivered = getAnalysisDelivery(deliveryKey)
+      if (alreadyDelivered?.status !== 'completed') {
+        if (callId && hasPendingCall(callId)) {
+          completeToolCall(callId, payload)
+          recordAnalysisDelivery(deliveryKey, 'completed', 'local:tool')
+        } else if (summaryMode) {
+          realtime.sendSystemEventSummary('Visual analysis completed.', payload)
+          recordAnalysisDelivery(deliveryKey, 'completed', 'local:summary')
+        }
+      } else {
+        logOrchestration('analysis.delivery.dedup', { key: deliveryKey, channel: 'local', prior: alreadyDelivered })
       }
       return result
     } catch (err: unknown) {
@@ -579,28 +613,32 @@ export default function MainScreen() {
         analysisState: 'failed',
         lastAnalysisStatus: 'failed',
       }))
-      if (callId && hasPendingCall(callId)) {
-        completeToolCall(callId, {
-          schemaVersion: '2.0',
-          status: 'failed',
-          snapshotId: snapshot.snapshotId,
-          turnId: snapshot.turnId,
-          correlationId: snapshot.correlationId,
-          error: message,
-        })
-      } else if (summaryMode) {
-        realtime.sendSystemEventSummary('Visual analysis failed.', {
-          snapshotId: snapshot.snapshotId,
-          turnId: snapshot.turnId,
-          correlationId: snapshot.correlationId,
-          error: message,
-        })
+      const deliveryKey = makeDeliveryKey(callId, snapshot.snapshotId, snapshot.turnId)
+      const payload = {
+        schemaVersion: '2.0',
+        status: 'failed' as const,
+        snapshotId: snapshot.snapshotId,
+        turnId: snapshot.turnId,
+        correlationId: snapshot.correlationId,
+        error: message,
+      }
+      const alreadyDelivered = getAnalysisDelivery(deliveryKey)
+      if (alreadyDelivered?.status !== 'failed') {
+        if (callId && hasPendingCall(callId)) {
+          completeToolCall(callId, payload)
+          recordAnalysisDelivery(deliveryKey, 'failed', 'local:tool')
+        } else if (summaryMode) {
+          realtime.sendSystemEventSummary('Visual analysis failed.', payload)
+          recordAnalysisDelivery(deliveryKey, 'failed', 'local:summary')
+        }
+      } else {
+        logOrchestration('analysis.delivery.dedup', { key: deliveryKey, channel: 'local', prior: alreadyDelivered })
       }
       return null
     } finally {
       setIsAnalyzing(false)
     }
-  }, [completeToolCall, hasPendingCall, realtime, sessionId, updatePendingCall])
+  }, [completeToolCall, getAnalysisDelivery, hasPendingCall, makeDeliveryKey, realtime, recordAnalysisDelivery, sessionId, updatePendingCall])
 
   const handleRequestPlantSnapshot = useCallback(async (callId: string, args: Record<string, unknown>) => {
     const reason = typeof args.reason === 'string' ? args.reason : 'visual inspection'
@@ -911,64 +949,118 @@ export default function MainScreen() {
     })
 
     if (type === 'analysis.completed') {
-      if (!matchesActiveVisualEvent) return
       const pending = findPendingAnalyzeCall(toolCallId, snapshotId, turnId)
-      if (pending) {
-        setAnalysis(payload as unknown as AnalysisResult)
-        setStatus('analysis completed via ws')
-        setVisualState((prev) => ({
+      const deliveryKey = makeDeliveryKey(toolCallId, snapshotId, turnId)
+      const alreadyDelivered = getAnalysisDelivery(deliveryKey)
+      const correlationId =
+        pending?.correlationId ||
+        (typeof (payload as Record<string, unknown>).correlationId === 'string'
+          ? (payload as Record<string, unknown>).correlationId
+          : null) ||
+        visualStateRef.current.correlationId ||
+        null
+      const resolvedSnapshotId = snapshotId || pending?.snapshotId || visualStateRef.current.activeSnapshotId
+      const resolvedTurnId = turnId || pending?.turnId || visualStateRef.current.activeTurnId
+      if (!pending && !toolCallId && !matchesActiveVisualEvent && !snapshotId && !turnId) return
+
+      setAnalysis(payload as unknown as AnalysisResult)
+      setStatus('analysis completed via ws')
+      setVisualState((prev) => {
+        const shouldAdoptPointers =
+          matchesActiveVisualEvent ||
+          (!prev.activeTurnId && !prev.activeSnapshotId) ||
+          (resolvedTurnId && resolvedTurnId === prev.activeTurnId) ||
+          (resolvedSnapshotId && resolvedSnapshotId === prev.activeSnapshotId)
+        return {
           ...prev,
-          analysisState: 'completed',
-          lastAnalysisStatus: 'completed',
-        }))
-        completeToolCall(pending.callId, {
-          schemaVersion: '2.0',
-          status: 'completed',
-          snapshotId: snapshotId || pending.snapshotId || null,
-          turnId: turnId || pending.turnId || null,
-          correlationId: pending.correlationId,
-          analysis: payload,
-        })
-      } else {
-        if ((snapshotId && snapshotId === activeSnapshotId) || (turnId && turnId === activeTurnId)) {
-          realtime.sendSystemEventSummary('Visual analysis completed.', {
-            snapshotId: snapshotId || activeSnapshotId,
-            turnId: turnId || activeTurnId,
-            toolCallId,
-            analysis: payload,
-          })
+          activeSnapshotId: shouldAdoptPointers ? (resolvedSnapshotId || prev.activeSnapshotId) : prev.activeSnapshotId,
+          activeTurnId: shouldAdoptPointers ? (resolvedTurnId || prev.activeTurnId) : prev.activeTurnId,
+          analysisState: shouldAdoptPointers ? 'completed' : prev.analysisState,
+          lastAnalysisStatus: shouldAdoptPointers ? 'completed' : prev.lastAnalysisStatus,
         }
+      })
+
+      if (alreadyDelivered?.status === 'completed') {
+        logOrchestration('analysis.delivery.dedup', { key: deliveryKey, channel: 'ws', prior: alreadyDelivered })
+        return
+      }
+
+      const payloadEnvelope = {
+        schemaVersion: '2.0',
+        status: 'completed' as const,
+        snapshotId: resolvedSnapshotId || null,
+        turnId: resolvedTurnId || null,
+        correlationId,
+        analysis: payload,
+      }
+
+      if (pending && hasPendingCall(pending.callId)) {
+        completeToolCall(pending.callId, payloadEnvelope)
+        recordAnalysisDelivery(deliveryKey, 'completed', 'ws:tool')
+      } else if (matchesActiveVisualEvent || resolvedSnapshotId || resolvedTurnId) {
+        realtime.sendSystemEventSummary('Visual analysis completed.', {
+          ...payloadEnvelope,
+          toolCallId,
+        })
+        recordAnalysisDelivery(deliveryKey, 'completed', 'ws:summary')
       }
       return
     }
 
     if (type === 'analysis.failed') {
-      if (!matchesActiveVisualEvent) return
       const pending = findPendingAnalyzeCall(toolCallId, snapshotId, turnId)
+      const deliveryKey = makeDeliveryKey(toolCallId, snapshotId, turnId)
+      const alreadyDelivered = getAnalysisDelivery(deliveryKey)
+      const correlationId =
+        pending?.correlationId ||
+        (typeof (payload as Record<string, unknown>).correlationId === 'string'
+          ? (payload as Record<string, unknown>).correlationId
+          : null) ||
+        visualStateRef.current.correlationId ||
+        null
+      const resolvedSnapshotId = snapshotId || pending?.snapshotId || visualStateRef.current.activeSnapshotId
+      const resolvedTurnId = turnId || pending?.turnId || visualStateRef.current.activeTurnId
+      if (!pending && !toolCallId && !matchesActiveVisualEvent && !snapshotId && !turnId) return
+
       setStatus(`analysis failed: ${payload.error || 'unknown'}`)
-      setVisualState((prev) => ({
-        ...prev,
-        analysisState: 'failed',
-        lastAnalysisStatus: 'failed',
-      }))
-      if (pending) {
-        completeToolCall(pending.callId, {
-          schemaVersion: '2.0',
-          status: 'failed',
-          snapshotId: snapshotId || pending.snapshotId || null,
-          turnId: turnId || pending.turnId || null,
-          correlationId: pending.correlationId,
-          error: payload.error || 'unknown',
-        })
-      } else {
-        if ((snapshotId && snapshotId === activeSnapshotId) || (turnId && turnId === activeTurnId)) {
-          realtime.sendSystemEventSummary('Visual analysis failed.', {
-            snapshotId: snapshotId || activeSnapshotId,
-            turnId: turnId || activeTurnId,
-            toolCallId,
-            error: payload.error || 'unknown',
-          })
+      setVisualState((prev) => {
+        const shouldAdoptPointers =
+          matchesActiveVisualEvent ||
+          (!prev.activeTurnId && !prev.activeSnapshotId) ||
+          (resolvedTurnId && resolvedTurnId === prev.activeTurnId) ||
+          (resolvedSnapshotId && resolvedSnapshotId === prev.activeSnapshotId)
+        return {
+          ...prev,
+          activeSnapshotId: shouldAdoptPointers ? (resolvedSnapshotId || prev.activeSnapshotId) : prev.activeSnapshotId,
+          activeTurnId: shouldAdoptPointers ? (resolvedTurnId || prev.activeTurnId) : prev.activeTurnId,
+          analysisState: shouldAdoptPointers ? 'failed' : prev.analysisState,
+          lastAnalysisStatus: shouldAdoptPointers ? 'failed' : prev.lastAnalysisStatus,
         }
+      })
+
+      if (alreadyDelivered?.status === 'failed') {
+        logOrchestration('analysis.delivery.dedup', { key: deliveryKey, channel: 'ws', prior: alreadyDelivered })
+        return
+      }
+
+      const payloadEnvelope = {
+        schemaVersion: '2.0',
+        status: 'failed' as const,
+        snapshotId: resolvedSnapshotId || null,
+        turnId: resolvedTurnId || null,
+        correlationId,
+        error: payload.error || 'unknown',
+      }
+
+      if (pending && hasPendingCall(pending.callId)) {
+        completeToolCall(pending.callId, payloadEnvelope)
+        recordAnalysisDelivery(deliveryKey, 'failed', 'ws:tool')
+      } else if (matchesActiveVisualEvent || resolvedSnapshotId || resolvedTurnId) {
+        realtime.sendSystemEventSummary('Visual analysis failed.', {
+          ...payloadEnvelope,
+          toolCallId,
+        })
+        recordAnalysisDelivery(deliveryKey, 'failed', 'ws:summary')
       }
       return
     }
@@ -1008,7 +1100,17 @@ export default function MainScreen() {
       setStatus(`visual guidance: ${guidance}`)
       realtime.sendSystemEventSummary(guidance, { reasonCode: payload.reasonCode || null })
     }
-  }, [addEvent, completeToolCall, findPendingAnalyzeCall, maybeTriggerCapture, realtime])
+  }, [
+    addEvent,
+    completeToolCall,
+    findPendingAnalyzeCall,
+    getAnalysisDelivery,
+    hasPendingCall,
+    makeDeliveryKey,
+    maybeTriggerCapture,
+    realtime,
+    recordAnalysisDelivery,
+  ])
 
   const ws = useWebSocket({ sessionId, onMessage: handleWsMessage })
 

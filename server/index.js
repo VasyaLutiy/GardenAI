@@ -182,14 +182,20 @@ function buildAnalysisRequestDedupeKey(sessionId, snapshotId, analysisGoal = 'di
 
 function summarizeVisualState(event, previous = {}) {
   const payload = isObject(event.payload) ? event.payload : {}
+  const resolutionEvent = event.type === 'analysis.completed' || event.type === 'analysis.failed'
+  const sameActiveTurn = !event.turnId || !previous.activeTurnId || previous.activeTurnId === event.turnId
+  const sameActiveSnapshot = !event.snapshotId || !previous.activeSnapshotId || previous.activeSnapshotId === event.snapshotId
+  const shouldPreserveActive = resolutionEvent && (!sameActiveTurn || !sameActiveSnapshot)
   const next = {
     ...previous,
     sessionId: event.sessionId,
-    activeCorrelationId: event.correlationId || previous.activeCorrelationId || previous.lastCorrelationId || null,
+    activeCorrelationId: shouldPreserveActive
+      ? previous.activeCorrelationId || previous.lastCorrelationId || null
+      : event.correlationId || previous.activeCorrelationId || previous.lastCorrelationId || null,
     correlationId: event.correlationId || previous.correlationId || null,
     lastCorrelationId: event.correlationId || previous.lastCorrelationId || previous.correlationId || null,
-    activeTurnId: event.turnId || previous.activeTurnId || null,
-    activeSnapshotId: event.snapshotId || previous.activeSnapshotId || null,
+    activeTurnId: shouldPreserveActive ? previous.activeTurnId || null : event.turnId || previous.activeTurnId || null,
+    activeSnapshotId: shouldPreserveActive ? previous.activeSnapshotId || null : event.snapshotId || previous.activeSnapshotId || null,
     analysisGoal: payload.analysisGoal || previous.analysisGoal || null,
     toolCallId: payload.toolCallId || previous.toolCallId || null,
     lastEventType: event.type,
@@ -237,14 +243,16 @@ function summarizeVisualState(event, previous = {}) {
       break
     case 'analysis.completed':
       next.analysisState = 'completed'
-      next.snapshotState = 'completed'
+      next.snapshotState = shouldPreserveActive ? previous.snapshotState || 'analyzing' : 'completed'
+      next.lastCompletedDisposition = shouldPreserveActive ? 'late' : 'in_window'
       next.lastCompletedCorrelationId = event.correlationId || previous.lastCompletedCorrelationId || null
       next.lastCompletedTurnId = event.turnId || previous.lastCompletedTurnId || null
       next.lastCompletedSnapshotId = event.snapshotId || previous.lastCompletedSnapshotId || null
       break
     case 'analysis.failed':
       next.analysisState = 'failed'
-      next.snapshotState = 'failed'
+      next.snapshotState = shouldPreserveActive ? previous.snapshotState || 'analyzing' : 'failed'
+      next.lastFailedDisposition = shouldPreserveActive ? 'late' : 'in_window'
       next.lastFailedCorrelationId = event.correlationId || previous.lastFailedCorrelationId || null
       next.lastFailedTurnId = event.turnId || previous.lastFailedTurnId || null
       next.lastFailedSnapshotId = event.snapshotId || previous.lastFailedSnapshotId || null
@@ -489,6 +497,13 @@ async function setToolReplyContext(client, value) {
     }),
     { EX: TOOL_REPLY_TTL_SEC }
   )
+}
+
+async function getToolReplyContext(client, toolCallId) {
+  if (!client || typeof client.get !== 'function' || !toolCallId) {
+    return null
+  }
+  return getJsonState(client, buildToolReplyContextKey(toolCallId))
 }
 
 function getVisualTransitionError(state, event) {
@@ -1099,19 +1114,23 @@ async function processOrchestratorMessage(client, msg) {
     })
   } else if (payload.type === 'analysis.completed') {
     await persistVisualState(client, payload)
+    const toolCallId = payload.toolCallId || payload?.payload?.toolCallId || null
+    const existingToolReply = toolCallId ? await getToolReplyContext(client, toolCallId) : null
+    const terminalStatus = existingToolReply?.status === 'timeout' ? 'completed_late' : 'completed'
     await setToolReplyContext(client, {
-      toolCallId: payload.toolCallId || payload?.payload?.toolCallId || null,
+      toolCallId,
       sessionId: payload.sessionId,
       correlationId: payload.correlationId || payload.messageId,
       turnId: payload.turnId || null,
       snapshotId: payload.snapshotId || null,
-      status: 'completed'
+      status: terminalStatus
     })
     orchestratorLogger.info('Visual analysis completed', {
       sessionId: payload.sessionId,
       correlationId: payload.correlationId || null,
       turnId: payload.turnId || null,
-      snapshotId: payload.snapshotId || null
+      snapshotId: payload.snapshotId || null,
+      terminalStatus
     })
   } else if (payload.type === 'analysis.failed') {
     await persistVisualState(client, payload)
@@ -1954,6 +1973,15 @@ app.post('/api/analyze-image', upload.single('image'), async (req, res) => {
       await sleep(200)
     }
 
+    await setToolReplyContext(redis, {
+      toolCallId,
+      sessionId,
+      correlationId,
+      turnId,
+      snapshotId,
+      analysisGoal,
+      status: 'timeout'
+    })
     return sendError(
       res,
       504,

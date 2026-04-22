@@ -1,5 +1,7 @@
 # GardenAI Implementation ToDo (4 Phases)
 
+Current status: backend phases are complete, server tests are green (`40/40`), and the remaining gap is a mobile automated test harness.
+
 ## Phase 1 — Foundation: Backend Skeleton and Contracts
 Goal: подготовить базовый backend-каркас, контракты и инфраструктурные заготовки.
 
