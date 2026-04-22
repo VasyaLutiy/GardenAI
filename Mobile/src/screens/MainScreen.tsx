@@ -68,6 +68,50 @@ function normalizeAnalysisGoal(intent: string): AnalysisGoal | null {
   return null
 }
 
+const LEGACY_TOOL_GOALS: Record<string, AnalysisGoal> = {
+  identify_plant: 'identify',
+  diagnose_plant: 'diagnose',
+  care_advice: 'care_advice',
+}
+
+function parseAnalysisGoal(value: unknown): AnalysisGoal | null {
+  if (typeof value !== 'string') return null
+  if (value === 'identify' || value === 'diagnose' || value === 'care_advice') return value
+  if (value === 'identify_plant') return 'identify'
+  if (value === 'diagnose_plant') return 'diagnose'
+  return null
+}
+
+function deriveCaptureRequestedGoal(rawPayload: Record<string, unknown> | null | undefined): AnalysisGoal | null {
+  if (!rawPayload) return null
+  const nested = (rawPayload.payload as Record<string, unknown> | undefined) || undefined
+  const candidates = [
+    rawPayload.analysisGoal,
+    rawPayload.analysis_goal,
+    rawPayload.intent,
+    rawPayload.goal,
+    nested?.analysisGoal,
+    nested?.analysis_goal,
+    nested?.intent,
+    nested?.goal,
+    nested?.requestedGoal,
+    nested?.requestedIntention,
+  ]
+
+  for (const candidate of candidates) {
+    const parsed = parseAnalysisGoal(candidate)
+    if (parsed) return parsed
+  }
+
+  const reason = typeof rawPayload.reason === 'string'
+    ? rawPayload.reason
+    : (typeof nested?.reason === 'string' ? nested.reason : '')
+  if (reason.startsWith('intent:identify_plant')) return 'identify'
+  if (reason.startsWith('intent:diagnose_plant')) return 'diagnose'
+
+  return null
+}
+
 export default function MainScreen() {
   const sessionId = useMemo(() => createId('session'), [])
 
@@ -620,7 +664,9 @@ export default function MainScreen() {
 
   const handleAnalyzePlantSnapshot = useCallback(async (callId: string, args: Record<string, unknown>) => {
     const snapshotId = typeof args.snapshotId === 'string' ? args.snapshotId : null
-    const analysisGoal = typeof args.analysis_goal === 'string' ? args.analysis_goal as AnalysisGoal : null
+    const analysisGoal = parseAnalysisGoal(
+      (args as Record<string, unknown>).analysis_goal ?? (args as Record<string, unknown>).analysisGoal ?? (args as Record<string, unknown>).goal ?? (args as Record<string, unknown>).intent,
+    )
 
     if (!snapshotId || !analysisGoal) {
       rejectToolCall(callId, 'invalid_arguments')
@@ -710,103 +756,6 @@ export default function MainScreen() {
     })
   }, [completeToolCall, getSnapshotById, registerPendingCall, rejectToolCall, runCapture])
 
-  const handleLegacyVisualTool = useCallback(async (
-    name: string,
-    callId: string,
-    _args: Record<string, unknown>,
-  ) => {
-    const analysisGoal =
-      name === 'identify_plant'
-        ? 'identify'
-        : name === 'diagnose_plant'
-          ? 'diagnose'
-          : name === 'care_advice'
-            ? 'care_advice'
-            : null
-
-    if (!analysisGoal) {
-      rejectToolCall(callId, 'unsupported_tool', { name })
-      return
-    }
-
-    const currentSnapshot = getSnapshotById(visualStateRef.current.activeSnapshotId)
-    logOrchestration('tool.legacy.redirect', {
-      name,
-      callId,
-      analysisGoal,
-      reusedSnapshotId: currentSnapshot?.snapshotId ?? null,
-    })
-
-    if (currentSnapshot) {
-      registerPendingCall({
-        callId,
-        name: 'analyze_plant_snapshot',
-        turnId: currentSnapshot.turnId,
-        snapshotId: currentSnapshot.snapshotId,
-        correlationId: currentSnapshot.correlationId,
-        analysisGoal,
-        createdAt: Date.now(),
-      })
-      await runAnalysis({
-        snapshot: currentSnapshot,
-        callId,
-        analysisGoal,
-      })
-      return
-    }
-
-    const turnId = createId('turn')
-    const snapshotId = createId('snap')
-    const correlationId = createId('corr')
-    registerPendingCall({
-      callId,
-      name: 'analyze_plant_snapshot',
-      turnId,
-      snapshotId,
-      correlationId,
-      analysisGoal,
-      createdAt: Date.now(),
-    })
-
-    const result = await runCapture({
-      turnId,
-      snapshotId,
-      correlationId,
-      causationId: callId,
-      captureMode: 'fresh_photo',
-      framingHint: analysisGoal === 'diagnose' ? 'problem_area' : 'whole_plant',
-      reason: `legacy_tool:${name}`,
-      source: `tool:${name}`,
-    })
-
-    if (result.status !== 'accepted') {
-      rejectToolCall(callId, result.reasonCode, {
-        correlationId,
-        snapshotId,
-        turnId,
-        legacyName: name,
-      })
-      return
-    }
-
-    const snapshot = getSnapshotById(snapshotId)
-    if (!snapshot) {
-      rejectToolCall(callId, 'snapshot_missing', {
-        correlationId,
-        snapshotId,
-        turnId,
-        legacyName: name,
-      })
-      return
-    }
-
-    await runAnalysis({
-      snapshot,
-      callId,
-      analysisGoal,
-    })
-  }, [getSnapshotById, registerPendingCall, rejectToolCall, runAnalysis, runCapture])
-
   const handleToolCall = useCallback(async (
     name: string,
     callId: string,
@@ -831,17 +780,21 @@ export default function MainScreen() {
       await handleRequestReframe(callId, args)
       return
     }
-    if (name === 'identify_plant' || name === 'diagnose_plant' || name === 'care_advice') {
-      await handleLegacyVisualTool(name, callId, args)
+    if (LEGACY_TOOL_GOALS[name]) {
+      const legacyGoal = LEGACY_TOOL_GOALS[name]
+      const snapshotId = typeof args.snapshotId === 'string' ? args.snapshotId : visualStateRef.current.activeSnapshotId
+      if (!snapshotId) {
+        rejectToolCall(callId, 'invalid_arguments', { reason: 'snapshotId_required_for_legacy_tool', legacyTool: name })
+        return
+      }
+      await handleAnalyzePlantSnapshot(callId, { snapshotId, analysis_goal: legacyGoal })
       return
     }
-
     rejectToolCall(callId, 'unsupported_tool', { name })
   }, [
     addEvent,
     handleAnalyzePlantSnapshot,
     handleGetVisualContext,
-    handleLegacyVisualTool,
     handleRequestPlantSnapshot,
     handleRequestReframe,
     rejectToolCall,
@@ -1021,7 +974,7 @@ export default function MainScreen() {
     }
 
     if (type === 'capture.requested') {
-      const goal = payload.reason === 'intent:identify_plant' ? 'identify' : 'diagnose'
+      const goal = deriveCaptureRequestedGoal(msg) || deriveCaptureRequestedGoal(payload) || 'diagnose'
       maybeTriggerCapture(
         'orchestrator:capture.requested',
         goal,

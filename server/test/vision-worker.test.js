@@ -84,6 +84,7 @@ test('processVisionCommand publishes analysis.completed into session stream with
   assert.equal(publishedEvent.type, 'analysis.completed')
   assert.equal(publishedEvent.turnId, 'turn-success')
   assert.equal(publishedEvent.snapshotId, 'snap-success')
+  assert.equal(publishedEvent.correlationId, 'corr-success')
   assert.equal(publishedEvent.toolCallId, 'call-success')
   assert.equal(publishedEvent.payload.species, 'Rose')
 })
@@ -123,6 +124,9 @@ test('processVisionCommand requeues on transient failure without deleting the ar
   assert.equal(retryCall[2], '*')
   const retriedEvent = JSON.parse(retryCall[3].payload)
   assert.equal(retriedEvent.messageId, 'msg-1')
+  assert.equal(retriedEvent.correlationId, 'corr-1')
+  assert.equal(retriedEvent.payload.turnId, 'turn-1')
+  assert.equal(retriedEvent.payload.snapshotId, 'snap-1')
   assert.equal(retriedEvent.payload.imageArtifactKey, 'artifact:image:msg-1')
   assert.equal(retriedEvent.payload.replyKey, 'analysis:reply:msg-1')
   assert.equal(retriedEvent.payload.toolCallId, 'call-1')
@@ -161,4 +165,13 @@ test('processVisionCommand deletes the artifact after terminal failure', async (
   assert.equal(client.calls.some((call) => call[0] === 'xAdd' && call[1] === 'stream:dlq'), true)
   assert.equal(client.calls.some((call) => call[0] === 'del' && call[1] === 'artifact:image:msg-2'), true)
   assert.equal(client.calls.some((call) => call[0] === 'set' && call[1] === 'analysis:reply:msg-2'), true)
+
+  const analysisResultAdd = client.calls.find(
+    (call) => call[0] === 'xAdd' && call[1] === 'stream:analysis-results'
+  )
+  const failedResult = JSON.parse(analysisResultAdd[3].payload)
+  assert.equal(failedResult.correlationId, 'corr-2')
+  assert.equal(failedResult.turnId, 'turn-2')
+  assert.equal(failedResult.snapshotId, 'snap-2')
+  assert.equal(failedResult.toolCallId, 'call-2')
 })

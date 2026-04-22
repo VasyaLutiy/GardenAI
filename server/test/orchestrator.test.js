@@ -164,3 +164,268 @@ test('processOrchestratorMessage sets tool reply context with correlation for an
   assert.equal(stored.turnId, 'turn-ctx')
   assert.equal(stored.status, 'pending')
 })
+
+test('processOrchestratorMessage marks capture.rejected as failed for the active turn', async () => {
+  const client = createClient({
+    sessionId: 'session-1',
+    activeTurnId: 'turn-1',
+    activeSnapshotId: 'snap-1',
+    captureState: 'requested'
+  })
+
+  await processOrchestratorMessage(client, {
+    id: '1710000000003-0',
+    message: {
+      payload: JSON.stringify({
+        messageId: 'evt-capture-rejected',
+        type: 'capture.rejected',
+        sessionId: 'session-1',
+        correlationId: 'corr-rejected',
+        causationId: 'cause-rejected',
+        turnId: 'turn-1',
+        snapshotId: 'snap-1',
+        tsWallIso: '2026-04-22T12:00:02.000Z',
+        schemaVersion: '2.0',
+        payload: { reason: 'camera_busy' }
+      })
+    }
+  })
+
+  const persistedState = JSON.parse(client.state.get('state:session-visual:session-1'))
+  assert.equal(persistedState.captureState, 'failed')
+  assert.equal(persistedState.activeTurnId, 'turn-1')
+  assert.equal(persistedState.activeSnapshotId, 'snap-1')
+  assert.equal(persistedState.lastEventType, 'capture.rejected')
+})
+
+test('processOrchestratorMessage only emits one capture.requested per intent cooldown window', async () => {
+  const client = createClient()
+  const intentEvent = {
+    messageId: 'evt-intent-1',
+    type: 'intent.detected',
+    sessionId: 'session-1',
+    correlationId: 'corr-intent-1',
+    causationId: 'cause-intent-1',
+    tsWallIso: '2026-04-22T12:00:03.000Z',
+    schemaVersion: '2.0',
+    payload: { intent: 'diagnose_plant', confidence: 0.93 }
+  }
+
+  await processOrchestratorMessage(client, { id: '1710000000004-0', message: { payload: JSON.stringify(intentEvent) } })
+  await processOrchestratorMessage(client, { id: '1710000000005-0', message: { payload: JSON.stringify(intentEvent) } })
+
+  const sessionAdds = client.calls.filter((call) => call[0] === 'xAdd' && call[1] === 'stream:session-events')
+  const captureRequests = sessionAdds
+    .map((call) => JSON.parse(call[3].payload))
+    .filter((event) => event.type === 'capture.requested')
+
+  assert.equal(captureRequests.length, 1)
+  assert.equal(captureRequests[0].correlationId, 'corr-intent-1')
+})
+
+test('processOrchestratorMessage emits capture.requested for reframe.requested with preserved correlation and ids', async () => {
+  const client = createClient({
+    sessionId: 'session-1',
+    activeTurnId: 'turn-prev',
+    activeSnapshotId: 'snap-prev',
+    analysisGoal: 'identify'
+  })
+
+  await processOrchestratorMessage(client, {
+    id: '1710000000006-0',
+    message: {
+      payload: JSON.stringify({
+        messageId: 'evt-reframe-1',
+        type: 'reframe.requested',
+        sessionId: 'session-1',
+        correlationId: 'corr-reframe-1',
+        causationId: 'cause-reframe-1',
+        turnId: 'turn-reframe',
+        snapshotId: 'snap-reframe',
+        schemaVersion: '2.0',
+        payload: {
+          reason: 'need closer view',
+          framingHint: 'focus on leaves',
+          requestedBy: 'assistant',
+          targetSnapshotId: 'snap-prev'
+        }
+      })
+    }
+  })
+
+  const captureAdd = client.calls.find((call) => call[0] === 'xAdd' && call[1] === 'stream:session-events')
+  assert.ok(captureAdd, 'capture.requested should be published')
+  const captureEvent = JSON.parse(captureAdd[3].payload)
+  assert.equal(captureEvent.type, 'capture.requested')
+  assert.equal(captureEvent.correlationId, 'corr-reframe-1')
+  assert.equal(captureEvent.turnId, 'turn-reframe')
+  assert.equal(captureEvent.snapshotId, 'snap-reframe')
+  assert.equal(captureEvent.payload.analysisGoal, 'identify')
+  assert.equal(captureEvent.payload.intention, 'identify')
+  assert.equal(captureEvent.payload.targetSnapshotId, 'snap-prev')
+
+  const turnState = JSON.parse(client.state.get('state:turn:turn-reframe'))
+  const snapshotState = JSON.parse(client.state.get('state:snapshot:snap-reframe'))
+  assert.equal(turnState.turnId, 'turn-reframe')
+  assert.equal(turnState.status, 'awaiting_capture')
+  assert.equal(snapshotState.snapshotId, 'snap-reframe')
+  assert.equal(snapshotState.status, 'requested')
+})
+
+test('reframe.requested carries analysisGoal into downstream analysis.requested when upload lacks goal', async () => {
+  const client = createClient({
+    sessionId: 'session-reframe-goal',
+    activeTurnId: 'turn-prev',
+    activeSnapshotId: 'snap-prev',
+    analysisGoal: 'diagnose'
+  })
+
+  const reframeEvent = {
+    messageId: 'evt-reframe-goal',
+    type: 'reframe.requested',
+    sessionId: 'session-reframe-goal',
+    correlationId: 'corr-reframe-goal',
+    causationId: 'cause-reframe-goal',
+    turnId: 'turn-reframe-goal',
+    snapshotId: 'snap-reframe-goal',
+    schemaVersion: '2.0',
+    payload: {
+      reason: 'zoom for diagnosis',
+      framingHint: 'leaf_closeup',
+      requestedBy: 'assistant',
+      targetSnapshotId: 'snap-prev',
+      analysisGoal: 'care_advice'
+    }
+  }
+
+  await processOrchestratorMessage(client, { id: '1710000000006-1', message: { payload: JSON.stringify(reframeEvent) } })
+
+  const uploadEvent = {
+    messageId: 'evt-upload-after-reframe',
+    type: 'snapshot.uploaded',
+    sessionId: 'session-reframe-goal',
+    correlationId: 'corr-reframe-goal',
+    causationId: 'cause-upload-goal',
+    turnId: 'turn-reframe-goal',
+    snapshotId: 'snap-reframe-goal',
+    tsWallIso: '2026-04-22T12:00:05.000Z',
+    schemaVersion: '2.0',
+    payload: {
+      artifactKey: 'artifact:image:evt-upload-after-reframe',
+      replyKey: 'analysis:reply:evt-upload-after-reframe',
+      toolCallId: 'call-reframe-upload'
+    }
+  }
+
+  await processOrchestratorMessage(client, { id: '1710000000006-2', message: { payload: JSON.stringify(uploadEvent) } })
+
+  const sessionAdds = client.calls.filter((call) => call[0] === 'xAdd' && call[1] === 'stream:session-events')
+  const analysisRequested = sessionAdds
+    .map((call) => JSON.parse(call[3].payload))
+    .find((evt) => evt.type === 'analysis.requested')
+
+  assert.ok(analysisRequested, 'analysis.requested should be published after upload')
+  assert.equal(analysisRequested.payload.analysisGoal, 'care_advice')
+  assert.equal(analysisRequested.correlationId, 'corr-reframe-goal')
+  assert.equal(analysisRequested.snapshotId, 'snap-reframe-goal')
+})
+
+test('processOrchestratorMessage does not duplicate capture.requested for the same reframe correlation', async () => {
+  const client = createClient()
+  const reframeEvent = {
+    messageId: 'evt-reframe-dup',
+    type: 'reframe.requested',
+    sessionId: 'session-dup',
+    correlationId: 'corr-reframe-dup',
+    causationId: 'cause-reframe-dup',
+    turnId: 'turn-dup',
+    snapshotId: 'snap-dup',
+    schemaVersion: '2.0',
+    payload: {
+      reason: 'duplicate test',
+      targetSnapshotId: 'snap-target'
+    }
+  }
+
+  await processOrchestratorMessage(client, { id: '1710000000007-0', message: { payload: JSON.stringify(reframeEvent) } })
+  await processOrchestratorMessage(client, { id: '1710000000008-0', message: { payload: JSON.stringify(reframeEvent) } })
+
+  const captureAdds = client.calls.filter((call) => call[0] === 'xAdd' && call[1] === 'stream:session-events')
+  const captureEvents = captureAdds.map((call) => JSON.parse(call[3].payload)).filter((evt) => evt.type === 'capture.requested')
+  assert.equal(captureEvents.length, 1)
+  assert.equal(captureEvents[0].correlationId, 'corr-reframe-dup')
+})
+
+test('persistTurnAndSnapshotState reads legacy turn key when turnId changes', async () => {
+  const client = createClient()
+  client.state.set('state:turn:legacy-session', JSON.stringify({
+    turnId: 'legacy-session',
+    sessionId: 'legacy-session',
+    status: 'awaiting_capture',
+    source: 'legacy-mobile'
+  }))
+
+  const uploadEvent = {
+    messageId: 'evt-legacy-upload',
+    type: 'snapshot.uploaded',
+    sessionId: 'legacy-session',
+    correlationId: 'corr-legacy',
+    causationId: 'cause-legacy',
+    turnId: 'turn-new',
+    snapshotId: 'snap-new',
+    schemaVersion: '2.0',
+    payload: {
+      artifactKey: 'artifact:image:evt-legacy-upload',
+      replyKey: 'analysis:reply:evt-legacy-upload',
+      toolCallId: 'call-legacy'
+    }
+  }
+
+  await processOrchestratorMessage(client, { id: '1710000000009-legacy', message: { payload: JSON.stringify(uploadEvent) } })
+
+  const getCalls = client.calls.filter((call) => call[0] === 'get').map((call) => call[1])
+  assert.ok(getCalls.includes('state:turn:legacy-session'), 'should check legacy turn key for compatibility')
+
+  const persistedTurn = JSON.parse(client.state.get('state:turn:turn-new'))
+  assert.equal(persistedTurn.turnId, 'turn-new')
+  assert.equal(persistedTurn.source, 'legacy-mobile')
+})
+
+test('processOrchestratorMessage persists turn and snapshot state keys for snapshot.uploaded', async () => {
+  const client = createClient()
+
+  await processOrchestratorMessage(client, {
+    id: '1710000000009-0',
+    message: {
+      payload: JSON.stringify({
+        messageId: 'evt-upload-state',
+        type: 'snapshot.uploaded',
+        sessionId: 'session-state',
+        correlationId: 'corr-state',
+        causationId: 'cause-state',
+        turnId: 'turn-state',
+        snapshotId: 'snap-state',
+        tsWallIso: '2026-04-22T12:00:04.000Z',
+        schemaVersion: '2.0',
+        payload: {
+          artifactKey: 'artifact:image:evt-upload-state',
+          replyKey: 'analysis:reply:evt-upload-state',
+          toolCallId: 'call-state',
+          analysisGoal: 'diagnose'
+        }
+      })
+    }
+  })
+
+  const turnStateRaw = client.state.get('state:turn:turn-state')
+  const snapshotStateRaw = client.state.get('state:snapshot:snap-state')
+  assert.ok(turnStateRaw, 'turn state should be stored under state:turn:*')
+  assert.ok(snapshotStateRaw, 'snapshot state should be stored under state:snapshot:*')
+
+  const turnState = JSON.parse(turnStateRaw)
+  const snapshotState = JSON.parse(snapshotStateRaw)
+  assert.equal(turnState.turnId, 'turn-state')
+  assert.equal(turnState.status, 'snapshot_ready')
+  assert.equal(snapshotState.snapshotId, 'snap-state')
+  assert.equal(snapshotState.status, 'uploaded')
+})

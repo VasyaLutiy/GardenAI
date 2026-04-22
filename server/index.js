@@ -48,6 +48,9 @@ const VISION_COMMANDS_STREAM = 'stream:vision-commands'
 const ANALYSIS_RESULTS_STREAM = 'stream:analysis-results'
 const DLQ_STREAM = 'stream:dlq'
 const VISUAL_SESSION_STATE_PREFIX = 'state:session-visual:'
+const TURN_STATE_PREFIX = 'state:turn:'
+const SNAPSHOT_STATE_PREFIX = 'state:snapshot:'
+const CAPTURE_DEDUPE_PREFIX = 'dedupe:capture:'
 const ORCHESTRATOR_GROUP = 'orchestrator-group'
 const VISION_GROUP = 'vision-group'
 const PENDING_MIN_IDLE_MS = Number(process.env.PENDING_MIN_IDLE_MS || 60000)
@@ -157,8 +160,20 @@ function buildVisualStateKey(sessionId) {
   return `${VISUAL_SESSION_STATE_PREFIX}${sessionId}`
 }
 
+function buildTurnStateKey(turnId) {
+  return `${TURN_STATE_PREFIX}${turnId}`
+}
+
+function buildSnapshotStateKey(snapshotId) {
+  return `${SNAPSHOT_STATE_PREFIX}${snapshotId}`
+}
+
 function buildToolReplyContextKey(toolCallId) {
   return `reply:tool:${toolCallId}`
+}
+
+function buildCaptureDedupeKey(sessionId, correlationId) {
+  return `${CAPTURE_DEDUPE_PREFIX}${sessionId}:${correlationId}`
 }
 
 function buildAnalysisRequestDedupeKey(sessionId, snapshotId, analysisGoal = 'diagnose') {
@@ -172,6 +187,7 @@ function summarizeVisualState(event, previous = {}) {
     sessionId: event.sessionId,
     activeCorrelationId: event.correlationId || previous.activeCorrelationId || previous.lastCorrelationId || null,
     correlationId: event.correlationId || previous.correlationId || null,
+    lastCorrelationId: event.correlationId || previous.lastCorrelationId || previous.correlationId || null,
     activeTurnId: event.turnId || previous.activeTurnId || null,
     activeSnapshotId: event.snapshotId || previous.activeSnapshotId || null,
     analysisGoal: payload.analysisGoal || previous.analysisGoal || null,
@@ -183,16 +199,23 @@ function summarizeVisualState(event, previous = {}) {
   switch (event.type) {
     case 'capture.requested':
       next.captureState = 'requested'
+      next.snapshotState = 'requested'
+      next.analysisState = 'idle'
+      next.reframeRequested = false
       break
     case 'capture.accepted':
-      next.captureState = 'captured'
+      next.captureState = 'accepted'
+      next.snapshotState = 'requested'
       break
     case 'capture.rejected':
       next.captureState = 'failed'
+      next.snapshotState = 'failed'
+      next.analysisState = 'failed'
       break
     case 'snapshot.available':
       next.captureState = 'captured'
       next.snapshotState = 'available'
+      next.analysisState = 'idle'
       break
     case 'snapshot.upload.requested':
       next.snapshotState = 'uploading'
@@ -226,6 +249,14 @@ function summarizeVisualState(event, previous = {}) {
       next.lastFailedTurnId = event.turnId || previous.lastFailedTurnId || null
       next.lastFailedSnapshotId = event.snapshotId || previous.lastFailedSnapshotId || null
       break
+    case 'reframe.requested':
+      next.captureState = 'requested'
+      next.snapshotState = 'requested'
+      next.analysisState = 'idle'
+      next.reframeRequested = true
+      next.reframeTargetSnapshotId = payload.targetSnapshotId || previous.activeSnapshotId || previous.reframeTargetSnapshotId || null
+      next.reframeReason = payload.reason || previous.reframeReason || null
+      break
     case 'assistant.visual_guidance':
       next.lastGuidance = payload.reasonCode || null
       break
@@ -236,23 +267,206 @@ function summarizeVisualState(event, previous = {}) {
   return next
 }
 
+function inferTurnStatus(eventType, previousStatus = 'idle') {
+  switch (eventType) {
+    case 'capture.requested':
+    case 'capture.accepted':
+    case 'reframe.requested':
+      return 'awaiting_capture'
+    case 'snapshot.available':
+    case 'snapshot.upload.requested':
+    case 'snapshot.uploaded':
+      return 'snapshot_ready'
+    case 'analysis.requested':
+      return 'analyzing'
+    case 'analysis.completed':
+      return 'completed'
+    case 'capture.rejected':
+    case 'analysis.failed':
+      return 'failed'
+    default:
+      return previousStatus || 'idle'
+  }
+}
+
+function inferSnapshotStatus(eventType, previousStatus = 'requested') {
+  switch (eventType) {
+    case 'capture.requested':
+    case 'reframe.requested':
+      return 'requested'
+    case 'capture.accepted':
+      return 'accepted'
+    case 'snapshot.available':
+      return 'captured'
+    case 'snapshot.upload.requested':
+      return previousStatus || 'captured'
+    case 'snapshot.uploaded':
+      return 'uploaded'
+    case 'analysis.requested':
+      return 'analyzing'
+    case 'analysis.completed':
+      return 'completed'
+    case 'capture.rejected':
+    case 'analysis.failed':
+      return 'failed'
+    default:
+      return previousStatus || 'requested'
+  }
+}
+
+async function getJsonState(client, key) {
+  if (!client || typeof client.get !== 'function' || !key) return null
+  const raw = await client.get(key)
+  if (!raw) return null
+  try {
+    return JSON.parse(raw)
+  } catch {
+    return null
+  }
+}
+
+async function setJsonState(client, key, state, ttlSeconds = VISUAL_STATE_TTL_SEC) {
+  if (!client || typeof client.set !== 'function' || !key || !isObject(state)) return
+  await client.set(key, JSON.stringify(state), { EX: ttlSeconds })
+}
+
+function summarizeTurnState(event, previous = {}, options = {}) {
+  if (!event?.sessionId || !event?.turnId) return null
+  const payload = isObject(event.payload) ? event.payload : {}
+  return {
+    ...previous,
+    turnId: event.turnId,
+    sessionId: event.sessionId,
+    correlationId: event.correlationId || previous.correlationId || null,
+    activeSnapshotId: event.snapshotId || previous.activeSnapshotId || null,
+    status: options.status || inferTurnStatus(event.type, previous.status),
+    source: payload.source || previous.source || null,
+    toolCallId:
+      options.toolCallId ||
+      event.toolCallId ||
+      payload.toolCallId ||
+      payload.callId ||
+      previous.toolCallId ||
+      null,
+    analysisGoal: options.analysisGoal || payload.analysisGoal || previous.analysisGoal || null,
+    requestedBy: payload.requestedBy || previous.requestedBy || null,
+    lastEventType: event.type,
+    updatedAt: event.tsWallIso || new Date().toISOString()
+  }
+}
+
+function summarizeSnapshotState(event, previous = {}, options = {}) {
+  if (!event?.snapshotId) return null
+  const payload = isObject(event.payload) ? event.payload : {}
+  return {
+    ...previous,
+    snapshotId: event.snapshotId,
+    sessionId: event.sessionId || previous.sessionId || null,
+    turnId: event.turnId || previous.turnId || null,
+    correlationId: event.correlationId || previous.correlationId || null,
+    status: options.status || inferSnapshotStatus(event.type, previous.status),
+    framingHint: payload.framingHint || previous.framingHint || null,
+    artifactKey: payload.artifactKey || payload.imageArtifactKey || previous.artifactKey || null,
+    uploadStrategy: payload.uploadStrategy || previous.uploadStrategy || null,
+    captureMode: payload.captureMode || previous.captureMode || null,
+    captureTs: payload.captureTs || previous.captureTs || null,
+    source: payload.source || previous.source || null,
+    reason: payload.reason || previous.reason || null,
+    targetSnapshotId: payload.targetSnapshotId || previous.targetSnapshotId || null,
+    toolCallId:
+      options.toolCallId ||
+      event.toolCallId ||
+      payload.toolCallId ||
+      payload.callId ||
+      previous.toolCallId ||
+      null,
+    analysisGoal: options.analysisGoal || payload.analysisGoal || previous.analysisGoal || null,
+    replyKey: payload.replyKey || previous.replyKey || null,
+    lastEventType: event.type,
+    updatedAt: event.tsWallIso || new Date().toISOString()
+  }
+}
+
+async function getTurnState(client, turnId, legacySessionId = null) {
+  const current = await getJsonState(client, buildTurnStateKey(turnId))
+  if (current || !legacySessionId) return current
+  return getJsonState(client, buildTurnStateKey(legacySessionId))
+}
+
+async function setTurnState(client, turnId, state, ttlSeconds = VISUAL_STATE_TTL_SEC) {
+  await setJsonState(client, buildTurnStateKey(turnId), state, ttlSeconds)
+}
+
+async function getSnapshotState(client, snapshotId) {
+  return getJsonState(client, buildSnapshotStateKey(snapshotId))
+}
+
+async function setSnapshotState(client, snapshotId, state, ttlSeconds = VISUAL_STATE_TTL_SEC) {
+  await setJsonState(client, buildSnapshotStateKey(snapshotId), state, ttlSeconds)
+}
+
+async function persistTurnAndSnapshotState(client, event, options = {}) {
+  if (!client || !event?.sessionId) {
+    return { turnState: null, snapshotState: null }
+  }
+
+  let turnState = null
+  if (event.turnId) {
+    const previousTurn = (await getTurnState(client, event.turnId, event.sessionId)) || {}
+    turnState = summarizeTurnState(event, previousTurn, {
+      status: options.turnStatus,
+      toolCallId: options.toolCallId,
+      analysisGoal: options.analysisGoal
+    })
+    if (turnState) {
+      await setTurnState(client, event.turnId, turnState, options.ttlSeconds)
+    }
+  }
+
+  let snapshotState = null
+  if (event.snapshotId) {
+    const previousSnapshot = (await getSnapshotState(client, event.snapshotId)) || {}
+    snapshotState = summarizeSnapshotState(event, previousSnapshot, {
+      status: options.snapshotStatus,
+      toolCallId: options.toolCallId,
+      analysisGoal: options.analysisGoal
+    })
+    if (snapshotState) {
+      await setSnapshotState(client, event.snapshotId, snapshotState, options.ttlSeconds)
+    }
+  }
+
+  return { turnState, snapshotState }
+}
+
+async function claimCaptureDedupe(client, sessionId, correlationId, value = '1', ttlSeconds = VISUAL_STATE_TTL_SEC) {
+  if (!client || typeof client.set !== 'function' || !sessionId || !correlationId) {
+    return 'claimed'
+  }
+  const result = await client.set(buildCaptureDedupeKey(sessionId, correlationId), value, {
+    NX: true,
+    EX: ttlSeconds
+  })
+  return result ? 'claimed' : 'duplicate'
+}
+
+async function clearCaptureDedupe(client, sessionId, correlationId) {
+  if (!client || typeof client.del !== 'function' || !sessionId || !correlationId) return
+  await client.del(buildCaptureDedupeKey(sessionId, correlationId))
+}
+
 async function persistVisualState(client, event) {
   if (!client || typeof client.get !== 'function' || typeof client.set !== 'function' || !event?.sessionId) {
     return null
   }
 
   const key = buildVisualStateKey(event.sessionId)
-  let previous = {}
-  const raw = await client.get(key)
-  if (raw) {
-    try {
-      previous = JSON.parse(raw)
-    } catch {
-      previous = {}
-    }
-  }
+  const previous = (await getJsonState(client, key)) || {}
   const next = summarizeVisualState(event, isObject(previous) ? previous : {})
   await client.set(key, JSON.stringify(next), { EX: VISUAL_STATE_TTL_SEC })
+  await persistTurnAndSnapshotState(client, event, {
+    ttlSeconds: VISUAL_STATE_TTL_SEC
+  })
   return next
 }
 
@@ -444,13 +658,7 @@ function visualSessionStateKey(sessionId) {
 }
 
 async function getVisualSessionState(client, sessionId) {
-  const raw = await client.get(visualSessionStateKey(sessionId))
-  if (!raw) return null
-  try {
-    return JSON.parse(raw)
-  } catch {
-    return null
-  }
+  return getJsonState(client, visualSessionStateKey(sessionId))
 }
 
 async function setVisualSessionState(client, sessionId, state, ttlSeconds = VISUAL_STATE_TTL_SEC) {
@@ -604,6 +812,12 @@ async function processOrchestratorMessage(client, msg) {
       updatedAt: new Date().toISOString()
     }
     await setVisualSessionState(client, payload.sessionId, nextState)
+    await persistTurnAndSnapshotState(client, payload, {
+      turnStatus: 'analyzing',
+      snapshotStatus: 'analyzing',
+      toolCallId,
+      analysisGoal
+    })
     await setToolReplyContext(client, {
       toolCallId,
       sessionId: payload.sessionId,
@@ -657,11 +871,22 @@ async function processOrchestratorMessage(client, msg) {
         EX: INTENT_CAPTURE_COOLDOWN_SEC
       })
       if (cooldownSet) {
+        const correlationId = payload.correlationId || payload.messageId
         const turnId = crypto.randomUUID()
         const snapshotId = crypto.randomUUID()
+        const captureClaim = await claimCaptureDedupe(client, payload.sessionId, correlationId, snapshotId)
+        if (captureClaim !== 'claimed') {
+          orchestratorLogger.info('Skipping duplicate capture.requested for correlation', {
+            sessionId: payload.sessionId,
+            correlationId,
+            detectedIntent
+          })
+          await client.xAck(SESSION_EVENTS_STREAM, ORCHESTRATOR_GROUP, msg.id)
+          return
+        }
         orchestratorLogger.info('Emitting capture.requested from intent', {
           sessionId: payload.sessionId,
-          correlationId: payload.correlationId || payload.messageId,
+          correlationId,
           turnId,
           snapshotId,
           detectedIntent,
@@ -671,7 +896,7 @@ async function processOrchestratorMessage(client, msg) {
           messageId: crypto.randomUUID(),
           type: 'capture.requested',
           sessionId: payload.sessionId,
-          correlationId: payload.correlationId || payload.messageId,
+          correlationId,
           causationId: payload.messageId,
           turnId,
           snapshotId,
@@ -709,8 +934,70 @@ async function processOrchestratorMessage(client, msg) {
         confidence
       })
     }
+  } else if (payload.type === 'reframe.requested') {
+    const correlationId = payload.correlationId || payload.messageId
+    const captureClaim = await claimCaptureDedupe(
+      client,
+      payload.sessionId,
+      correlationId,
+      payload.snapshotId || payload.messageId
+    )
+    if (captureClaim !== 'claimed') {
+      orchestratorLogger.info('Skipping duplicate reframe.requested for correlation', {
+        sessionId: payload.sessionId,
+        correlationId,
+        snapshotId: payload.snapshotId || null
+      })
+      await client.xAck(SESSION_EVENTS_STREAM, ORCHESTRATOR_GROUP, msg.id)
+      return
+    }
+
+    const currentState = await getVisualSessionState(client, payload.sessionId)
+    const nextState = await persistVisualState(client, payload)
+    const analysisGoal =
+      payload?.payload?.analysisGoal ||
+      payload?.payload?.intention ||
+      nextState?.analysisGoal ||
+      currentState?.analysisGoal ||
+      null
+    const captureRequested = {
+      messageId: crypto.randomUUID(),
+      type: 'capture.requested',
+      sessionId: payload.sessionId,
+      userId: payload.userId || null,
+      correlationId,
+      causationId: payload.messageId,
+      turnId: payload.turnId || nextState?.activeTurnId || currentState?.activeTurnId || null,
+      snapshotId: payload.snapshotId || nextState?.activeSnapshotId || currentState?.activeSnapshotId || null,
+      tsWallIso: new Date().toISOString(),
+      schemaVersion: payload.schemaVersion || '2.0',
+      payload: {
+        reason: payload?.payload?.reason || 'reframe_requested',
+        captureMode: 'fresh_photo',
+        framingHint: payload?.payload?.framingHint || null,
+        requestedBy: payload?.payload?.requestedBy || 'reframe',
+        analysisGoal,
+        intention: payload?.payload?.intention || analysisGoal,
+        targetSnapshotId:
+          payload?.payload?.targetSnapshotId ||
+          currentState?.activeSnapshotId ||
+          nextState?.reframeTargetSnapshotId ||
+          null
+      }
+    }
+    await publishSessionEvent(client, captureRequested)
+    orchestratorLogger.info('Published capture.requested from reframe.requested', {
+      sessionId: payload.sessionId,
+      correlationId,
+      turnId: captureRequested.turnId || null,
+      snapshotId: captureRequested.snapshotId || null,
+      targetSnapshotId: captureRequested.payload.targetSnapshotId || null
+    })
   } else if (payload.type === 'snapshot.available' || payload.type === 'snapshot.upload.requested') {
     await persistVisualState(client, payload)
+    if (payload.type === 'snapshot.available') {
+      await clearCaptureDedupe(client, payload.sessionId, payload.correlationId || payload.messageId)
+    }
     orchestratorLogger.info('Snapshot lifecycle updated', {
       sessionId: payload.sessionId,
       eventType: payload.type,
@@ -721,6 +1008,7 @@ async function processOrchestratorMessage(client, msg) {
   } else if (payload.type === 'snapshot.uploaded') {
     const currentState = await getVisualSessionState(client, payload.sessionId)
     const nextState = await persistVisualState(client, payload)
+    await clearCaptureDedupe(client, payload.sessionId, payload.correlationId || payload.messageId)
     const analysisGoal = payload?.payload?.analysisGoal || nextState?.analysisGoal || currentState?.analysisGoal || 'diagnose'
     const sameRequestAlreadyStarted =
       nextState?.analysisRequestedCorrelationId === (payload.correlationId || payload.messageId) &&
@@ -790,7 +1078,18 @@ async function processOrchestratorMessage(client, msg) {
       snapshotId: analysisRequested.snapshotId || null
     })
   } else if (payload.type === 'capture.requested' || payload.type === 'capture.accepted' || payload.type === 'capture.rejected') {
+    if (payload.type === 'capture.requested') {
+      await claimCaptureDedupe(
+        client,
+        payload.sessionId,
+        payload.correlationId || payload.messageId,
+        payload.snapshotId || payload.messageId
+      )
+    }
     await persistVisualState(client, payload)
+    if (payload.type === 'capture.rejected') {
+      await clearCaptureDedupe(client, payload.sessionId, payload.correlationId || payload.messageId)
+    }
     orchestratorLogger.info('Visual capture lifecycle updated', {
       sessionId: payload.sessionId,
       eventType: payload.type,
@@ -1058,6 +1357,12 @@ async function processVisionCommand(client, event) {
         updatedAt: new Date().toISOString()
       })
     }
+    await persistTurnAndSnapshotState(client, resultEvent, {
+      turnStatus: 'completed',
+      snapshotStatus: 'completed',
+      toolCallId: command.toolCallId || null,
+      analysisGoal: command.analysisGoal || null
+    })
     visionLogger.info('Vision analysis completed', {
       sessionId: event.sessionId,
       correlationId: event.correlationId || null,
@@ -1149,6 +1454,12 @@ async function processVisionCommand(client, event) {
         updatedAt: new Date().toISOString()
       })
     }
+    await persistTurnAndSnapshotState(client, failedResult, {
+      turnStatus: 'failed',
+      snapshotStatus: 'failed',
+      toolCallId: command.toolCallId || null,
+      analysisGoal: command.analysisGoal || null
+    })
     await client.xAdd(DLQ_STREAM, '*', {
       messageId: failedResult.messageId,
       sessionId: failedResult.sessionId,
@@ -1516,7 +1827,7 @@ app.post('/api/analyze-image', upload.single('image'), async (req, res) => {
     const imageArtifactKey = `artifact:image:${messageId}`
     const imageTtl = RETENTION_HOURS * 60 * 60
     await redis.set(imageArtifactKey, buildDataUrlFromUpload(req.file), { EX: imageTtl })
-    await setVisualSessionState(redis, sessionId, {
+    const initialVisualState = {
       sessionId,
       activeCorrelationId: correlationId,
       activeTurnId: turnId,
@@ -1526,7 +1837,8 @@ app.post('/api/analyze-image', upload.single('image'), async (req, res) => {
       lastToolCallId: toolCallId,
       lastCorrelationId: correlationId,
       updatedAt: new Date().toISOString()
-    })
+    }
+    await setVisualSessionState(redis, sessionId, initialVisualState)
     await setToolReplyContext(redis, {
       toolCallId,
       sessionId,
@@ -1560,6 +1872,12 @@ app.post('/api/analyze-image', upload.single('image'), async (req, res) => {
         source: uploadSource,
       }
     }
+    await persistTurnAndSnapshotState(redis, event, {
+      turnStatus: 'snapshot_ready',
+      snapshotStatus: 'uploaded',
+      toolCallId,
+      analysisGoal
+    })
     appLogger.info('Analysis requested', {
       requestId: req.requestId,
       sessionId: event.sessionId,
