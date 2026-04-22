@@ -1,14 +1,12 @@
-# GardenAI — Gardener AI Agent (Web Starter)
+# GardenAI
 
-This repository contains a minimal starter scaffold for a web-based Gardener AI Agent.
+GardenAI is a mobile-first plant assistant with split mobile/server visual orchestration.
 
 Overview:
-- `client/` — React + Vite single-page app. Accesses camera and microphone, captures photos, and has placeholders for OpenAI realtime audio integration.
-- `server/` — Minimal Express server with endpoints:
-  - `GET /api/realtime-token` — mints an Azure OpenAI realtime client secret.
-  - `POST /api/analyze-image` — accepts an image upload and sends it to Azure OpenAI vision model.
+- `Mobile/` - React Native app with a checked-in native Android project under `Mobile/android`. Owns camera access, the local snapshot buffer, realtime tool calls, and the visual UX.
+- `server/` - Express API, Redis-backed orchestration, vision worker, storage cleanup, and WebSocket fanout.
 
-Quick start (run client and server separately):
+Quick start:
 
 Server
 
@@ -16,11 +14,38 @@ Server
 cd server
 npm install
 cp .env.example .env
-# edit .env and set Azure OpenAI endpoint/key/deployments
 npm start
 ```
 
-Run backend tests
+Mobile
+
+```bash
+cd Mobile
+npm install
+npm start
+```
+
+How to build Android APK
+
+Prereqs:
+- Java 17+ installed locally
+- Android SDK and platform tools available
+
+Build:
+```bash
+cd Mobile/android
+./gradlew assembleRelease
+```
+
+Output:
+- `Mobile/android/app/build/outputs/apk/release/app-release.apk`
+
+Notes:
+- `expo prebuild` is not required for normal APK builds.
+- Only use `expo prebuild` if native Android code or config must be regenerated, since it can rewrite the checked-in native project.
+- The current release APK build is suitable for testing, but runtime validation on a device is still recommended.
+
+Backend tests and smoke checks
 
 ```bash
 cd server
@@ -29,42 +54,13 @@ npm run smoke:events
 npm run smoke:ws
 ```
 
-Client
-
-```bash
-cd client
-npm install
-npm run dev
-```
-
 Notes:
-- Backend uses Azure OpenAI and reads secrets from `server/.env`.
-- Required server env vars:
-  - `AZURE_OPENAI_ENDPOINT` (example: `https://<resource>.openai.azure.com`)
-  - `AZURE_OPENAI_API_KEY`
-  - `AZURE_OPENAI_REALTIME_DEPLOYMENT` (Azure deployment name for realtime model)
-  - `AZURE_OPENAI_VISION_DEPLOYMENT` (Azure deployment name for vision-capable model)
-  - `REDIS_URL` (example: `redis://localhost:6379`)
-  - `REALTIME_TOKEN_AUTH_SECRET` (optional shared secret required by `/api/realtime-token` when set)
-- `GET /api/realtime-token` calls Azure endpoint `/openai/v1/realtime/client_secrets`.
-- WebRTC clients should POST SDP to `/openai/v1/realtime/calls` using the returned `token`.
-- `POST /api/analyze-image` calls Azure Chat Completions API using the vision deployment.
-- `POST /api/events` validates canonical event envelopes and atomically dedupes, enqueues to Redis stream `stream:session-events`, and fans out to `chan:session:<sessionId>`.
-- `GET /api/realtime-token` requires `x-gardenai-realtime-token-secret` only when `REALTIME_TOKEN_AUTH_SECRET` is configured.
-- `POST /api/analyze-image` now follows event flow: `analysis.requested` -> `vision.analyze.command` -> `analysis.completed/failed`.
-- Realtime transcript events can emit `intent.detected`; orchestrator can publish `capture.requested` and `assistant.prompt`.
-- Retry policy for vision worker: 3 attempts with backoff (`300ms`, `1s`, `2.5s`), then message goes to `stream:dlq`.
-- Storage worker performs stream TTL cleanup using `XTRIM MINID` based on `RETENTION_HOURS`.
-- WebSocket gateway is available at `/ws?sessionId=<id>` and fans out Redis `chan:session:<id>` events to subscribed clients.
-- API errors are normalized as `{ error, code, requestId, details }`.
+- Visual events use `schemaVersion: 2.0` on the mobile side.
+- Legacy visual aliases are still accepted on mobile and route through the unified `analyze_plant_snapshot` path during the transition.
+- The server keeps separate turn and snapshot state, dedupes capture/reframe events, and preserves `analysisGoal` through reframe.
+- `POST /api/analyze-image` is part of the visual flow: upload -> `analysis.requested` -> `vision.analyze.command` -> `analysis.completed` / `analysis.failed`.
+- `POST /api/events` validates canonical envelopes and fans out session events to Redis streams and WebSocket clients.
+- `GET /api/realtime-token` requires `x-gardenai-realtime-token-secret` only when `REALTIME_TOKEN_AUTH_SECRET` is set.
+- Server tests are green (`40/40`). Mobile still has no automated test harness, so visual flow verification remains manual.
+- Required server env vars: `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_REALTIME_DEPLOYMENT`, `AZURE_OPENAI_VISION_DEPLOYMENT`, `REDIS_URL`.
 - Health and metrics: `GET /healthz`, `GET /metrics`.
-- Rate limiting is enabled on `/api` and WebSocket connections (configurable in `.env`).
-- Optional CORS restriction with `CORS_ORIGIN` (comma-separated origins).
-- For verbose request logging and realtime token failures, set `LOG_REQUESTS=1` and inspect server stdout.
-- Component logging controls:
-  - `LOG_LEVEL=debug|info|warn|error`
-  - `LOG_JSON=1` (default structured logs) or `LOG_JSON=0` (plain text)
-
-Next steps I can take for you:
-- Add websocket auth (signed session token).
-- Split in-process orchestrator/workers into separate processes and deployment units.

@@ -35,7 +35,7 @@ export function buildEnvelope(
     correlationId: correlationId ?? createId('corr'),
     causationId: causationId ?? createId('cause'),
     tsWallIso: new Date().toISOString(),
-    schemaVersion: '1.0',
+    schemaVersion: '2.0',
     payload,
     snapshotId,
     turnId,

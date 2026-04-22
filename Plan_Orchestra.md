@@ -1,24 +1,24 @@
-• Proposed Plan
-
-
-  # Live Visual Tooling And Orchestrator Design
+# Plan_Orchestra
 
   ## Summary
 
-  Перевести текущий visual pipeline с одного монолитного tool take_photo_and_analyze на двухфазную схему capture -> analyze, где:
+  Visual orchestration is implemented across mobile and server.
 
-  - Realtime-модель инициирует действия через мелкие tools.
-  - Mobile владеет камерой и локальным snapshot buffer.
-  - Redis остаётся control plane для turn/snapshot state.
-  - server/index.js становится координатором lifecycle, а не только прокладкой между upload и vision worker.
+  - Mobile owns camera capture, the local snapshot buffer, and the realtime visual tools.
+  - Mobile visual events use `schemaVersion: 2.0`.
+  - Legacy visual aliases are still accepted on mobile and route through the unified `analyze_plant_snapshot` path as transitional compatibility.
+  - Server persists separate turn and snapshot state in Redis and dedupes capture/reframe events.
+  - `reframe.requested` preserves `analysisGoal` and carries it into downstream `analysis.requested`.
+  - Server tests are green (`40/40`).
+  - Mobile still has no automated test harness, so manual visual verification is still required.
 
-  Базовый принцип: бинарные кадры не хранятся в Redis; Redis хранит только состояние, correlation и orchestration events.
+  Redis is the control plane for orchestration state and events. Binary frames are not stored in Redis.
 
   ## Public Interfaces
 
-  ### New Realtime Tools
+  ### Realtime Tools
 
-  Заменить текущий single tool на 4 tools. Все tools объявляются в Mobile/src/config.ts и отправляются в session.update.
+  The mobile app exposes 4 visual tools via `Mobile/src/config.ts` and `session.update`.
 
   #### 1. request_plant_snapshot
 
@@ -170,8 +170,7 @@
     "turnId": "turn-uuid"
   }
 
-  Если не хочется вводить top-level snapshotId/turnId, допустимо хранить их в payload, но выбрать один стиль и использовать везде. Рекомендация: snapshotId и turnId
-  вынести в top-level для queryability и логов.
+  `snapshotId` and `turnId` are carried at the top level for queryability and logging.
 
   ## Redis Event Types
 
@@ -204,19 +203,20 @@
 
   ### Redis Keys
 
-  Добавить state keys:
+  Current keys:
 
-  - state:turn:<sessionId>: active turn JSON
-  - state:snapshot:<snapshotId>: snapshot state JSON
-  - state:session-visual:<sessionId>: current camera/analyze state
-  - dedupe:capture:<sessionId>:<correlationId>
-  - reply:tool:<callId> для tool result routing
+  - `state:turn:<sessionId>`: active turn JSON
+  - `state:snapshot:<snapshotId>`: snapshot state JSON
+  - `state:session-visual:<sessionId>`: current camera/analyze state
+  - `dedupe:capture:<sessionId>:<correlationId>`
+  - `dedupe:analysis-requested:<sessionId>:<snapshotId>:<analysisGoal>`
+  - `reply:tool:<callId>` for tool result routing
 
-  TTL:
+  TTLs:
 
-  - turn/snapshot state: 10-30 минут
-  - reply keys: 2 минуты
-  - image artifacts: оставить текущий TTL
+  - turn/snapshot state: 10-30 minutes
+  - reply keys: 2 minutes
+  - image artifacts: keep the existing TTL
 
   ## Orchestrator State Machine
 
@@ -275,14 +275,13 @@
 
   ### Orchestrator Policy
 
-  - Один активный visual turn на session.
-  - Новый request_plant_snapshot при активном awaiting_capture|analyzing не создаёт второй capture:
-    возвращать существующий snapshotId, если он ещё валиден.
-  - analyze_plant_snapshot без валидного snapshotId возвращает structured error.
-  - Auto-analyze включить только для intents identify|diagnose; для care_advice сначала пытаться использовать свежий snapshot, иначе просить его.
-  - request_reframe создаёт новый snapshotId, но наследует тот же turnId/correlationId.
+  - One active visual turn per session.
+  - `request_plant_snapshot` during `awaiting_capture` or `analyzing` reuses the existing valid snapshot instead of creating a second capture.
+  - `analyze_plant_snapshot` without a valid `snapshotId` returns a structured error.
+  - Auto-analyze is enabled for `identify` and `diagnose`; `care_advice` still prefers a fresh snapshot first.
+  - `request_reframe` creates a new `snapshotId` while preserving the same `turnId` and `correlationId`.
 
-  ## Point Changes
+  ## Implementation Notes
 
   ### server/index.js
 
@@ -382,6 +381,7 @@
   - request_reframe создаёт новый snapshot с тем же turnId
   - server-pushed analysis.completed доставляется только в активный call
   - гонка tool_call + intent fallback не создаёт второй capture
+  - automated mobile harness is still missing; coverage is manual for now
 
   ### End-to-End
 
@@ -391,9 +391,9 @@
 
   ## Assumptions And Defaults
 
-  - server/index.js пока остаётся точкой интеграции; вынос в отдельные модули не входит в этот этап.
-  - Redis используется только для control/state/events; изображения в Redis не стримятся.
-  - На первом этапе live flow означает “безшовный snapshot from recent buffer”, а не непрерывный video inference.
-  - Backward compatibility с текущим /api/analyze-image сохраняется.
-  - Один session поддерживает один активный visual turn.
-  - По умолчанию auto-analyze включён после snapshot.available для identify и diagnose; для остальных целей нужен явный tool call analyze_plant_snapshot.
+  - `server/index.js` still hosts the current integration point.
+  - Redis is used only for control/state/events; images are not streamed through Redis.
+  - The live flow uses a recent buffered still when available, not continuous video inference.
+  - Backward compatibility with the current `/api/analyze-image` path is preserved.
+  - One session supports one active visual turn.
+  - Auto-analyze is enabled after `snapshot.available` for `identify` and `diagnose`; other goals still require an explicit `analyze_plant_snapshot` call.
