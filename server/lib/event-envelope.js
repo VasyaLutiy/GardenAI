@@ -74,6 +74,10 @@ function validateEnvelope(body) {
       const error = requirePayloadString(payload, 'analysisGoal')
       if (error) return error
     }
+    if (body.type === 'snapshot.upload.requested') {
+      const error = requirePayloadString(payload, 'uploadStrategy')
+      if (error) return error
+    }
     if (body.type === 'reframe.requested') {
       const error = requirePayloadString(payload, 'reason') || requirePayloadString(payload, 'framingHint')
       if (error) return error

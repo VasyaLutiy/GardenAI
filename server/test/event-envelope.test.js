@@ -64,3 +64,19 @@ test('validateEnvelope accepts strict visual analysis envelope', () => {
   })
   assert.equal(err, null)
 })
+
+test('validateEnvelope requires uploadStrategy for snapshot.upload.requested', () => {
+  const err = validateEnvelope({
+    messageId: 'm4',
+    type: 'snapshot.upload.requested',
+    sessionId: 's1',
+    correlationId: 'c1',
+    causationId: 'cause-1',
+    tsWallIso: '2026-04-22T12:00:00.000Z',
+    schemaVersion: '2.0',
+    turnId: 'turn-1',
+    snapshotId: 'snap-1',
+    payload: {}
+  })
+  assert.equal(err, 'payload.uploadStrategy is required')
+})

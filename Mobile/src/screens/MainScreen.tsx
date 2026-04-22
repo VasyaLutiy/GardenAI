@@ -373,16 +373,32 @@ export default function MainScreen() {
     }
 
     try {
+      const uploadCausationId = callId || createId('cause')
+      await postVisualEvent('snapshot.upload.requested', {
+        snapshotId: snapshot.snapshotId,
+        uploadStrategy: 'multipart_http',
+        analysisGoal,
+        source: 'mobile_upload',
+      }, {
+        correlationId: snapshot.correlationId,
+        causationId: uploadCausationId,
+        snapshotId: snapshot.snapshotId,
+        turnId: snapshot.turnId,
+      })
+
       const result = await uploadImageForAnalysis(
         snapshot.uri,
         sessionId,
         snapshot.correlationId,
-        callId || createId('cause'),
+        uploadCausationId,
         {
           snapshotId: snapshot.snapshotId,
           turnId: snapshot.turnId,
           toolCallId: callId,
           analysisGoal,
+          captureTs: new Date(snapshot.captureTs).toISOString(),
+          framingHint: snapshot.framingHint,
+          source: 'mobile_capture',
         },
       )
       setAnalysis(result)

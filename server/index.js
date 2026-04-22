@@ -185,14 +185,27 @@ function summarizeVisualState(event, previous = {}) {
     case 'capture.rejected':
       next.captureState = 'failed'
       break
+    case 'snapshot.available':
+      next.captureState = 'captured'
+      next.snapshotState = 'available'
+      break
+    case 'snapshot.upload.requested':
+      next.snapshotState = 'uploading'
+      break
+    case 'snapshot.uploaded':
+      next.snapshotState = 'uploaded'
+      break
     case 'analysis.requested':
       next.analysisState = 'requested'
+      next.snapshotState = 'analyzing'
       break
     case 'analysis.completed':
       next.analysisState = 'completed'
+      next.snapshotState = 'completed'
       break
     case 'analysis.failed':
       next.analysisState = 'failed'
+      next.snapshotState = 'failed'
       break
     case 'assistant.visual_guidance':
       next.lastGuidance = payload.reasonCode || null
@@ -489,6 +502,44 @@ async function processOrchestratorMessage(client, msg) {
         confidence
       })
     }
+  } else if (payload.type === 'snapshot.available' || payload.type === 'snapshot.upload.requested') {
+    await persistVisualState(client, payload)
+    orchestratorLogger.info('Snapshot lifecycle updated', {
+      sessionId: payload.sessionId,
+      eventType: payload.type,
+      correlationId: payload.correlationId || null,
+      turnId: payload.turnId || null,
+      snapshotId: payload.snapshotId || null
+    })
+  } else if (payload.type === 'snapshot.uploaded') {
+    await persistVisualState(client, payload)
+    const currentState = await getVisualSessionState(client, payload.sessionId)
+    const analysisRequested = {
+      messageId: crypto.randomUUID(),
+      type: 'analysis.requested',
+      sessionId: payload.sessionId,
+      userId: payload.userId || null,
+      correlationId: payload.correlationId || payload.messageId,
+      causationId: payload.causationId || payload.messageId,
+      turnId: payload.turnId || currentState?.activeTurnId || null,
+      snapshotId: payload.snapshotId || currentState?.activeSnapshotId || null,
+      tsWallIso: new Date().toISOString(),
+      schemaVersion: payload.schemaVersion || '2.0',
+      payload: {
+        imageArtifactKey: payload?.payload?.artifactKey || null,
+        replyKey: payload?.payload?.replyKey || null,
+        toolCallId: payload?.payload?.toolCallId || null,
+        analysisGoal: payload?.payload?.analysisGoal || currentState?.analysisGoal || 'diagnose',
+        attempt: 1
+      }
+    }
+    await publishSessionEvent(client, analysisRequested)
+    orchestratorLogger.info('Published analysis.requested from snapshot.uploaded', {
+      sessionId: payload.sessionId,
+      correlationId: analysisRequested.correlationId,
+      turnId: analysisRequested.turnId || null,
+      snapshotId: analysisRequested.snapshotId || null
+    })
   } else if (payload.type === 'capture.requested' || payload.type === 'capture.accepted' || payload.type === 'capture.rejected') {
     await persistVisualState(client, payload)
     orchestratorLogger.info('Visual capture lifecycle updated', {
@@ -1194,21 +1245,15 @@ app.post('/api/analyze-image', upload.single('image'), async (req, res) => {
     recordMetric('analyzeRequests')
     const messageId = crypto.randomUUID()
     const sessionId = req.body?.sessionId || `upload-${messageId}`
-    const correlationId = req.body?.correlationId || null
+    const correlationId = req.body?.correlationId || messageId
     const causationId = req.body?.causationId || req.requestId
-    const turnId = req.body?.turnId || null
-    const snapshotId = req.body?.snapshotId || null
+    const turnId = req.body?.turnId || crypto.randomUUID()
+    const snapshotId = req.body?.snapshotId || crypto.randomUUID()
     const toolCallId = req.body?.toolCallId || null
     const analysisGoal = req.body?.analysisGoal || 'diagnose'
-    if (!correlationId || !turnId || !snapshotId) {
-      return sendError(
-        res,
-        400,
-        'missing_visual_context',
-        'correlationId, turnId and snapshotId are required',
-        req.requestId
-      )
-    }
+    const captureTs = req.body?.captureTs || new Date().toISOString()
+    const framingHint = req.body?.framingHint || null
+    const uploadSource = req.body?.source || 'http_upload'
     const replyKey = `analysis:reply:${messageId}`
     const imageArtifactKey = `artifact:image:${messageId}`
     const imageTtl = RETENTION_HOURS * 60 * 60
@@ -1219,6 +1264,7 @@ app.post('/api/analyze-image', upload.single('image'), async (req, res) => {
       activeSnapshotId: snapshotId,
       analysisState: 'requested',
       analysisGoal,
+      snapshotState: 'uploaded',
       lastToolCallId: toolCallId,
       lastCorrelationId: correlationId,
       updatedAt: new Date().toISOString()
@@ -1234,7 +1280,7 @@ app.post('/api/analyze-image', upload.single('image'), async (req, res) => {
     })
     const event = {
       messageId,
-      type: 'analysis.requested',
+      type: 'snapshot.uploaded',
       sessionId,
       userId: req.body?.userId || null,
       seq: null,
@@ -1246,11 +1292,14 @@ app.post('/api/analyze-image', upload.single('image'), async (req, res) => {
       snapshotId,
       schemaVersion: '2.0',
       payload: {
-        imageArtifactKey,
+        artifactKey: imageArtifactKey,
         replyKey,
         toolCallId,
         analysisGoal,
-        attempt: 1
+        mimeType: req.file.mimetype || 'image/jpeg',
+        captureTs,
+        framingHint,
+        source: uploadSource,
       }
     }
     appLogger.info('Analysis requested', {
@@ -1260,7 +1309,8 @@ app.post('/api/analyze-image', upload.single('image'), async (req, res) => {
       correlationId: event.correlationId,
       turnId,
       snapshotId,
-      toolCallId
+      toolCallId,
+      legacySnapshot: !req.body?.snapshotId
     })
 
     await publishSessionEvent(redis, event)

@@ -38,6 +38,9 @@ export interface UploadAnalysisOptions {
   turnId?: string
   toolCallId?: string
   analysisGoal?: 'identify' | 'diagnose' | 'care_advice'
+  captureTs?: string
+  framingHint?: string
+  source?: string
 }
 
 // FormData с URI — надёжный способ для Android и iOS.
@@ -58,6 +61,9 @@ export async function uploadImageForAnalysis(
   if (options.turnId) fd.append('turnId', options.turnId)
   if (options.toolCallId) fd.append('toolCallId', options.toolCallId)
   if (options.analysisGoal) fd.append('analysisGoal', options.analysisGoal)
+  if (options.captureTs) fd.append('captureTs', options.captureTs)
+  if (options.framingHint) fd.append('framingHint', options.framingHint)
+  if (options.source) fd.append('source', options.source)
 
   const { data } = await http.post<AnalysisResult>('/api/analyze-image', fd, {
     headers: { 'Content-Type': 'multipart/form-data' },
